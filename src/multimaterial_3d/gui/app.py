@@ -1119,10 +1119,9 @@ class MainWindow(QMainWindow):
             from ..postprocessors.layer_pattern import parse_pattern
             from ..analysis.mechanical import analyze_layup
             from ..analysis.thermal import thermal_stress_analysis, predict_warping
+            from ..core.materials import get_material
             from .analysis_viz import (
-                create_layup_viz, create_stress_through_thickness_viz,
-                create_thermal_stress_viz, create_warping_viz,
-                create_flat_plate_viz,
+                create_warping_viz, create_flat_plate_viz,
             )
 
             pattern = parse_pattern(params['pattern'])
@@ -1146,68 +1145,128 @@ class MainWindow(QMainWindow):
                     print(f"  Radius of curvature: {warp['radius']:.0f} mm")
             self._log(buf.getvalue())
 
-            # ── Build visualizations based on selected mode ──────────
-            from ..core.materials import get_material
+            # ── Prepare mesh for visualization ───────────────────────
+            # Use the actual imported model if available; otherwise
+            # fall back to generated rectangular slab geometry.
+            base_mesh = None
+            if self._input_path:
+                try:
+                    base_mesh = load_mesh_from_3mf(self._input_path)
+                except Exception:
+                    pass
+
+            if base_mesh is None or base_mesh.n_cells == 0:
+                # Fallback: generate a rectangular block matching dimensions
+                from .analysis_viz import create_layup_viz
+                base_mesh, _ = create_layup_viz(pattern, lh, th, material_map)
+                self._log("  Using generated block geometry (no model loaded).")
+            else:
+                self._log(f"  Using imported model geometry ({base_mesh.n_cells} faces).")
+
+            QApplication.processEvents()
+
+            # Build material legend
             unique_mats = sorted(set(pattern))
             legend_items = {}
             for i, f in enumerate(unique_mats):
                 mat = get_material(material_map.get(f, 'PLA'))
                 legend_items[f"F{f}: {mat.name}"] = MATERIAL_COLORS[i % len(MATERIAL_COLORS)]
 
+            # ── Visualization mode ───────────────────────────────────
             if viz_mode == 'layup_stress':
-                # LEFT: material layup, RIGHT: bending stress distribution
                 self._log("  Rendering: Material layup + Bending stress...")
                 QApplication.processEvents()
 
-                layup_mesh, _ = create_layup_viz(
-                    pattern, lh, th, material_map)
+                # LEFT: actual model colored by material
+                mat_mesh = color_mesh_by_layers(
+                    base_mesh.copy(), lh, pattern=pattern, material_map=material_map)
                 self.viewer.show_mesh(
-                    layup_mesh, target='before', scalars='material',
+                    mat_mesh, target='before', scalars='material',
                     cmap=MATERIAL_COLORS[:len(unique_mats)],
                     title='Material Layup',
                     material_legend=legend_items)
 
-                stress_mesh = create_stress_through_thickness_viz(
-                    pattern, lh, th, material_map, mech_results)
+                # RIGHT: same model colored by bending stress
+                stress_mesh = color_mesh_by_layers(base_mesh.copy(), lh)
+                z_neutral = mech_results['abd']['z_neutral']
+                num_layers = round(th / lh)
+                pattern_len = len(pattern)
+                z_min = stress_mesh.bounds[4]
+
+                # Compute per-cell bending stress from layer and material
+                layers_arr = stress_mesh.cell_data['layer']
+                stresses = np.zeros(len(layers_arr))
+                for k in range(num_layers):
+                    filament = pattern[k % pattern_len]
+                    mat = get_material(material_map.get(filament, 'PLA'))
+                    z_mid = (k + 0.5) * lh
+                    sigma = mat.E * (z_mid - z_neutral)
+                    mask = layers_arr == k
+                    stresses[mask] = sigma
+
+                max_abs = max(abs(stresses.min()), abs(stresses.max()), 1e-10)
+                stress_mesh.cell_data['bending_stress'] = stresses / max_abs
                 self.viewer.show_mesh(
                     stress_mesh, target='after', scalars='bending_stress',
                     cmap='coolwarm',
-                    title='Bending Stress (blue=compression, red=tension)')
+                    title='Bending Stress (blue=compr, red=tension)')
+
+                # Legend
                 self.viewer._set_legend('none')
-                # Add custom legend for stress
                 self.viewer.legend_widget.setVisible(True)
                 while self.viewer.legend_layout.count():
                     child = self.viewer.legend_layout.takeAt(0)
                     if child.widget():
                         child.widget().deleteLater()
-                na_lbl = QLabel(
-                    f"Neutral axis: {mech_results['abd']['z_neutral']:.2f}mm  |  "
-                    f"Blue=compression  White=neutral  Red=tension  |  "
-                    f"Symmetric: {'Yes' if mech_results['abd']['symmetric'] else 'No (will warp)'}")
-                na_lbl.setStyleSheet("color: #a6adc8; font-size: 11px; background: transparent;")
-                self.viewer.legend_layout.addWidget(na_lbl)
+                sym_str = 'Yes' if mech_results['abd']['symmetric'] else 'No (will warp)'
+                lbl = QLabel(
+                    f"Neutral axis: {z_neutral:.2f}mm | "
+                    f"Blue=compression  White=neutral  Red=tension | "
+                    f"Symmetric: {sym_str}")
+                lbl.setStyleSheet("color: #a6adc8; font-size: 11px; background: transparent;")
+                self.viewer.legend_layout.addWidget(lbl)
                 self.viewer.legend_layout.addStretch()
 
             elif viz_mode == 'layup_thermal':
-                # LEFT: material layup, RIGHT: thermal stress at interfaces
                 self._log("  Rendering: Material layup + Thermal stress...")
                 QApplication.processEvents()
 
-                layup_mesh, _ = create_layup_viz(
-                    pattern, lh, th, material_map)
+                # LEFT: material layup on actual model
+                mat_mesh = color_mesh_by_layers(
+                    base_mesh.copy(), lh, pattern=pattern, material_map=material_map)
                 self.viewer.show_mesh(
-                    layup_mesh, target='before', scalars='material',
+                    mat_mesh, target='before', scalars='material',
                     cmap=MATERIAL_COLORS[:len(unique_mats)],
                     title='Material Layup',
                     material_legend=legend_items)
 
-                thermal_mesh = create_thermal_stress_viz(
-                    pattern, lh, th, material_map, thermal_results)
+                # RIGHT: thermal stress on actual model
+                thermal_mesh = color_mesh_by_layers(base_mesh.copy(), lh)
+                num_layers = round(th / lh)
+
+                # Build per-layer thermal stress from interface results
+                layer_thermal = np.zeros(num_layers)
+                for iface in thermal_results.get('interface_stresses', []):
+                    idx = iface['layer_index']
+                    stress = iface['sigma_normal']
+                    if 0 <= idx < num_layers:
+                        layer_thermal[idx] = max(layer_thermal[idx], stress)
+                    if 0 <= idx + 1 < num_layers:
+                        layer_thermal[idx + 1] = max(layer_thermal[idx + 1], stress)
+
+                layers_arr = thermal_mesh.cell_data['layer']
+                t_stresses = np.zeros(len(layers_arr))
+                for k in range(num_layers):
+                    mask = layers_arr == k
+                    t_stresses[mask] = layer_thermal[k]
+
+                thermal_mesh.cell_data['thermal_stress'] = t_stresses
                 self.viewer.show_mesh(
                     thermal_mesh, target='after', scalars='thermal_stress',
                     cmap='hot',
-                    title='Thermal Stress at Interfaces (MPa)')
-                # Legend for thermal
+                    title='Thermal Interface Stress (MPa)')
+
+                # Legend
                 self.viewer._set_legend('none')
                 self.viewer.legend_widget.setVisible(True)
                 while self.viewer.legend_layout.count():
@@ -1217,17 +1276,16 @@ class MainWindow(QMainWindow):
                 risk = thermal_results.get('risk_level', 'unknown')
                 max_s = thermal_results.get('max_normal_stress', 0)
                 max_t = thermal_results.get('max_shear_stress', 0)
-                th_lbl = QLabel(
-                    f"Max normal: {max_s:.1f} MPa  |  "
-                    f"Max shear: {max_t:.1f} MPa  |  "
-                    f"Risk: {risk.upper()}  |  "
-                    f"Black=0 MPa  Bright=high stress")
-                th_lbl.setStyleSheet("color: #a6adc8; font-size: 11px; background: transparent;")
-                self.viewer.legend_layout.addWidget(th_lbl)
+                lbl = QLabel(
+                    f"Max normal: {max_s:.1f} MPa | "
+                    f"Max shear: {max_t:.1f} MPa | "
+                    f"Risk: {risk.upper()} | "
+                    f"Black=0  Bright=high stress")
+                lbl.setStyleSheet("color: #a6adc8; font-size: 11px; background: transparent;")
+                self.viewer.legend_layout.addWidget(lbl)
                 self.viewer.legend_layout.addStretch()
 
             elif viz_mode == 'warping':
-                # LEFT: flat plate, RIGHT: warped plate
                 self._log("  Rendering: Flat vs Warped shape...")
                 QApplication.processEvents()
 
@@ -1241,6 +1299,7 @@ class MainWindow(QMainWindow):
                     'Flat (no warping)', position='upper_left',
                     font_size=10, color='#cdd6f4')
                 self.viewer.plotter_before.reset_camera()
+                self.viewer._mesh_before = None
 
                 warped, scale = create_warping_viz(
                     pattern, lh, th, material_map, warp, pl)
@@ -1252,11 +1311,12 @@ class MainWindow(QMainWindow):
                     show_scalar_bar=False)
                 defl = warp['deflection']
                 self.viewer.plotter_after.add_text(
-                    f'Warped (deflection: {defl:.3f}mm, scale: {scale:.0f}x)',
+                    f'Warped ({defl:.3f}mm, {scale:.0f}x exaggeration)',
                     position='upper_left', font_size=10, color='#cdd6f4')
                 self.viewer.plotter_after.reset_camera()
+                self.viewer._mesh_after = None
 
-                # Warping legend
+                # Legend
                 self.viewer._set_legend('none')
                 self.viewer.legend_widget.setVisible(True)
                 while self.viewer.legend_layout.count():
@@ -1264,20 +1324,16 @@ class MainWindow(QMainWindow):
                     if child.widget():
                         child.widget().deleteLater()
                 sym = 'Yes' if mech_results['abd']['symmetric'] else 'No'
-                w_lbl = QLabel(
-                    f"Curvature: {warp['curvature']:.6f} 1/mm  |  "
-                    f"Deflection ({pl}mm part): {defl:.3f}mm  |  "
-                    f"Symmetric: {sym}  |  "
+                lbl = QLabel(
+                    f"Curvature: {warp['curvature']:.6f} 1/mm | "
+                    f"Deflection ({pl}mm): {defl:.3f}mm | "
+                    f"Symmetric: {sym} | "
                     f"Exaggeration: {scale:.0f}x")
-                w_lbl.setStyleSheet("color: #a6adc8; font-size: 11px; background: transparent;")
-                self.viewer.legend_layout.addWidget(w_lbl)
+                lbl.setStyleSheet("color: #a6adc8; font-size: 11px; background: transparent;")
+                self.viewer.legend_layout.addWidget(lbl)
                 self.viewer.legend_layout.addStretch()
 
-            # Clear mesh references so slider doesn't interfere
-            self.viewer._mesh_before = None
-            self.viewer._mesh_after = None
             self.viewer._gcode_mesh = None
-
             self.progress.setVisible(False)
             self.status.showMessage("Analysis complete.")
             QApplication.processEvents()
