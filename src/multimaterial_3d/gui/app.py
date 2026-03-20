@@ -740,12 +740,32 @@ class MainWindow(QMainWindow):
         # Reload and display result
         if self._output_path and Path(self._output_path).exists():
             try:
-                result_mesh = load_mesh_from_3mf(self._output_path)
-                lh = self.layer_panel.layer_height.value()
-                result_mesh = color_mesh_by_layers(result_mesh, lh)
-                self.viewer.show_mesh(result_mesh, target='after',
-                                      scalars='layer', cmap='turbo',
-                                      title='Result')
+                # First try to show G-code visualization (for tools that
+                # modify G-code, the output 3MF may not have mesh changes
+                # but will have modified G-code paths)
+                shown = False
+                with zipfile.ZipFile(self._output_path, 'r') as zf:
+                    for name in zf.namelist():
+                        if name.endswith('.gcode'):
+                            gcode_content = zf.read(name).decode('utf-8')
+                            gcode_mesh = parse_gcode_paths(
+                                gcode_content, max_layers=100
+                            )
+                            if gcode_mesh:
+                                self.viewer.show_gcode(
+                                    gcode_mesh, target='after'
+                                )
+                                shown = True
+                            break
+
+                if not shown:
+                    # Fall back to mesh visualization
+                    result_mesh = load_mesh_from_3mf(self._output_path)
+                    lh = self.layer_panel.layer_height.value()
+                    result_mesh = color_mesh_by_layers(result_mesh, lh)
+                    self.viewer.show_mesh(result_mesh, target='after',
+                                          scalars='layer', cmap='turbo',
+                                          title='Result')
             except Exception:
                 pass
 

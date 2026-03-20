@@ -251,4 +251,7 @@ FEATURE_COLORS = [
     [0.94, 0.75, 0.55],  # overhang wall — orange
     [0.55, 0.94, 0.94],  # top surface — cyan
     [0.75, 0.55, 0.94],  # bottom surface — purple
+    [0.85, 0.85, 0.55],  # prime tower — dark yellow
+    [0.60, 0.60, 0.60],  # custom — dim gray
+    [0.80, 0.55, 0.70],  # skirt — pink
 ]
