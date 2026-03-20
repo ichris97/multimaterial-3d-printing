@@ -575,6 +575,13 @@ class AnalysisPanel(QWidget):
         self.part_length.setValue(100.0)
         g.addWidget(self.part_length, 5, 1)
 
+        g.addWidget(QLabel("Visualization:"), 6, 0)
+        self.viz_combo = QComboBox()
+        self.viz_combo.addItem("Material Layup + Bending Stress", "layup_stress")
+        self.viz_combo.addItem("Material Layup + Thermal Stress", "layup_thermal")
+        self.viz_combo.addItem("Flat vs Warped Shape", "warping")
+        g.addWidget(self.viz_combo, 6, 1)
+
         layout.addWidget(grp)
 
         btn = QPushButton("Run Analysis")
@@ -590,6 +597,7 @@ class AnalysisPanel(QWidget):
             'mat1': self.mat1_combo.currentData(),
             'mat2': self.mat2_combo.currentData(),
             'part_length': self.part_length.value(),
+            'viz_mode': self.viz_combo.currentData(),
         })
 
 
@@ -1111,25 +1119,168 @@ class MainWindow(QMainWindow):
             from ..postprocessors.layer_pattern import parse_pattern
             from ..analysis.mechanical import analyze_layup
             from ..analysis.thermal import thermal_stress_analysis, predict_warping
+            from .analysis_viz import (
+                create_layup_viz, create_stress_through_thickness_viz,
+                create_thermal_stress_viz, create_warping_viz,
+                create_flat_plate_viz,
+            )
 
             pattern = parse_pattern(params['pattern'])
             material_map = {1: params['mat1'], 2: params['mat2']}
+            lh = params['layer_height']
+            th = params['total_height']
+            pl = params['part_length']
+            viz_mode = params.get('viz_mode', 'layup_stress')
 
+            # Run analysis (text output to console)
             buf = io.StringIO()
             with redirect_stdout(buf):
-                analyze_layup(pattern, params['total_height'],
-                              params['layer_height'], material_map)
-                thermal_stress_analysis(pattern, params['layer_height'],
-                                        params['total_height'], material_map)
-                warp = predict_warping(pattern, params['layer_height'],
-                                       params['total_height'], material_map,
-                                       part_length=params['part_length'])
-                print(f"\n  Warping for {params['part_length']}mm part: "
+                mech_results = analyze_layup(pattern, th, lh, material_map)
+                thermal_results = thermal_stress_analysis(
+                    pattern, lh, th, material_map)
+                warp = predict_warping(pattern, lh, th, material_map,
+                                       part_length=pl)
+                print(f"\n  Warping for {pl}mm part: "
                       f"{warp['deflection']:.3f} mm")
+                if abs(warp['curvature']) > 1e-12:
+                    print(f"  Radius of curvature: {warp['radius']:.0f} mm")
             self._log(buf.getvalue())
+
+            # ── Build visualizations based on selected mode ──────────
+            from ..core.materials import get_material
+            unique_mats = sorted(set(pattern))
+            legend_items = {}
+            for i, f in enumerate(unique_mats):
+                mat = get_material(material_map.get(f, 'PLA'))
+                legend_items[f"F{f}: {mat.name}"] = MATERIAL_COLORS[i % len(MATERIAL_COLORS)]
+
+            if viz_mode == 'layup_stress':
+                # LEFT: material layup, RIGHT: bending stress distribution
+                self._log("  Rendering: Material layup + Bending stress...")
+                QApplication.processEvents()
+
+                layup_mesh, _ = create_layup_viz(
+                    pattern, lh, th, material_map)
+                self.viewer.show_mesh(
+                    layup_mesh, target='before', scalars='material',
+                    cmap=MATERIAL_COLORS[:len(unique_mats)],
+                    title='Material Layup',
+                    material_legend=legend_items)
+
+                stress_mesh = create_stress_through_thickness_viz(
+                    pattern, lh, th, material_map, mech_results)
+                self.viewer.show_mesh(
+                    stress_mesh, target='after', scalars='bending_stress',
+                    cmap='coolwarm',
+                    title='Bending Stress (blue=compression, red=tension)')
+                self.viewer._set_legend('none')
+                # Add custom legend for stress
+                self.viewer.legend_widget.setVisible(True)
+                while self.viewer.legend_layout.count():
+                    child = self.viewer.legend_layout.takeAt(0)
+                    if child.widget():
+                        child.widget().deleteLater()
+                na_lbl = QLabel(
+                    f"Neutral axis: {mech_results['abd']['z_neutral']:.2f}mm  |  "
+                    f"Blue=compression  White=neutral  Red=tension  |  "
+                    f"Symmetric: {'Yes' if mech_results['abd']['symmetric'] else 'No (will warp)'}")
+                na_lbl.setStyleSheet("color: #a6adc8; font-size: 11px; background: transparent;")
+                self.viewer.legend_layout.addWidget(na_lbl)
+                self.viewer.legend_layout.addStretch()
+
+            elif viz_mode == 'layup_thermal':
+                # LEFT: material layup, RIGHT: thermal stress at interfaces
+                self._log("  Rendering: Material layup + Thermal stress...")
+                QApplication.processEvents()
+
+                layup_mesh, _ = create_layup_viz(
+                    pattern, lh, th, material_map)
+                self.viewer.show_mesh(
+                    layup_mesh, target='before', scalars='material',
+                    cmap=MATERIAL_COLORS[:len(unique_mats)],
+                    title='Material Layup',
+                    material_legend=legend_items)
+
+                thermal_mesh = create_thermal_stress_viz(
+                    pattern, lh, th, material_map, thermal_results)
+                self.viewer.show_mesh(
+                    thermal_mesh, target='after', scalars='thermal_stress',
+                    cmap='hot',
+                    title='Thermal Stress at Interfaces (MPa)')
+                # Legend for thermal
+                self.viewer._set_legend('none')
+                self.viewer.legend_widget.setVisible(True)
+                while self.viewer.legend_layout.count():
+                    child = self.viewer.legend_layout.takeAt(0)
+                    if child.widget():
+                        child.widget().deleteLater()
+                risk = thermal_results.get('risk_level', 'unknown')
+                max_s = thermal_results.get('max_normal_stress', 0)
+                max_t = thermal_results.get('max_shear_stress', 0)
+                th_lbl = QLabel(
+                    f"Max normal: {max_s:.1f} MPa  |  "
+                    f"Max shear: {max_t:.1f} MPa  |  "
+                    f"Risk: {risk.upper()}  |  "
+                    f"Black=0 MPa  Bright=high stress")
+                th_lbl.setStyleSheet("color: #a6adc8; font-size: 11px; background: transparent;")
+                self.viewer.legend_layout.addWidget(th_lbl)
+                self.viewer.legend_layout.addStretch()
+
+            elif viz_mode == 'warping':
+                # LEFT: flat plate, RIGHT: warped plate
+                self._log("  Rendering: Flat vs Warped shape...")
+                QApplication.processEvents()
+
+                flat = create_flat_plate_viz(th, pl)
+                self.viewer.plotter_before.clear()
+                self.viewer.plotter_before.set_background('#181825')
+                self.viewer.plotter_before.add_mesh(
+                    flat, color='#b4befe', show_edges=True,
+                    edge_color='#45475a', line_width=0.5)
+                self.viewer.plotter_before.add_text(
+                    'Flat (no warping)', position='upper_left',
+                    font_size=10, color='#cdd6f4')
+                self.viewer.plotter_before.reset_camera()
+
+                warped, scale = create_warping_viz(
+                    pattern, lh, th, material_map, warp, pl)
+                self.viewer.plotter_after.clear()
+                self.viewer.plotter_after.set_background('#181825')
+                self.viewer.plotter_after.add_mesh(
+                    warped, scalars='warping', cmap='coolwarm',
+                    show_edges=True, edge_color='#45475a', line_width=0.5,
+                    show_scalar_bar=False)
+                defl = warp['deflection']
+                self.viewer.plotter_after.add_text(
+                    f'Warped (deflection: {defl:.3f}mm, scale: {scale:.0f}x)',
+                    position='upper_left', font_size=10, color='#cdd6f4')
+                self.viewer.plotter_after.reset_camera()
+
+                # Warping legend
+                self.viewer._set_legend('none')
+                self.viewer.legend_widget.setVisible(True)
+                while self.viewer.legend_layout.count():
+                    child = self.viewer.legend_layout.takeAt(0)
+                    if child.widget():
+                        child.widget().deleteLater()
+                sym = 'Yes' if mech_results['abd']['symmetric'] else 'No'
+                w_lbl = QLabel(
+                    f"Curvature: {warp['curvature']:.6f} 1/mm  |  "
+                    f"Deflection ({pl}mm part): {defl:.3f}mm  |  "
+                    f"Symmetric: {sym}  |  "
+                    f"Exaggeration: {scale:.0f}x")
+                w_lbl.setStyleSheet("color: #a6adc8; font-size: 11px; background: transparent;")
+                self.viewer.legend_layout.addWidget(w_lbl)
+                self.viewer.legend_layout.addStretch()
+
+            # Clear mesh references so slider doesn't interfere
+            self.viewer._mesh_before = None
+            self.viewer._mesh_after = None
+            self.viewer._gcode_mesh = None
 
             self.progress.setVisible(False)
             self.status.showMessage("Analysis complete.")
+            QApplication.processEvents()
 
         except Exception as e:
             self._on_error(f"{e}\n{traceback.format_exc()}")
