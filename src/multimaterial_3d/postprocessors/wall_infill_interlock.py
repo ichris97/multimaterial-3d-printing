@@ -300,7 +300,11 @@ def process_gcode(gcode_content: str, teeth_depth: float, teeth_pitch: float,
     infill = re.compile(r';\s*FEATURE:\s*(Sparse|Internal|Solid)\s*infill', re.IGNORECASE)
     any_feature = re.compile(r';\s*FEATURE:\s*', re.IGNORECASE)
     z_height = re.compile(r';\s*Z_HEIGHT:\s*([\d.]+)')
-    g1_move = re.compile(r'^G1\s+X([\d.]+)\s+Y([\d.]+)(?:.*E([\d.]+))?(?:.*F(\d+))?', re.IGNORECASE)
+    g1_move = re.compile(r'^G1\s+X([\d.]+)\s+Y([\d.]+)', re.IGNORECASE)
+    e_pattern = re.compile(r'E(-?[\d.]+)', re.IGNORECASE)
+    f_pattern = re.compile(r'F(\d+)', re.IGNORECASE)
+
+    layer_change = re.compile(r';\s*CHANGE_LAYER', re.IGNORECASE)
 
     in_inner_wall = False
     in_infill = False
@@ -309,9 +313,8 @@ def process_gcode(gcode_content: str, teeth_depth: float, teeth_pitch: float,
     current_f = 3000
 
     for line in lines:
-        z_match = z_height.search(line)
-        if z_match:
-            current_layer = int(float(z_match.group(1)) / 0.2)
+        if layer_change.search(line):
+            current_layer += 1
 
         # Feature transitions
         if inner_wall.search(line):
@@ -332,8 +335,10 @@ def process_gcode(gcode_content: str, teeth_depth: float, teeth_pitch: float,
         if move_match:
             new_x = float(move_match.group(1))
             new_y = float(move_match.group(2))
-            new_e = float(move_match.group(3)) if move_match.group(3) else None
-            new_f = int(move_match.group(4)) if move_match.group(4) else current_f
+            e_m = e_pattern.search(line)
+            f_m = f_pattern.search(line)
+            new_e = float(e_m.group(1)) if e_m else None
+            new_f = int(f_m.group(1)) if f_m else current_f
             current_f = new_f
 
             is_extrusion = new_e is not None and new_e > 0

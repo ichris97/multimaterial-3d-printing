@@ -150,8 +150,9 @@ def optimize_material_distribution(
     else:
         # For 3+ materials, use a coarser grid search
         step = 5  # 5% increments
-        _search_n_materials(filaments, materials, total_height, objective,
-                            E_min, sigma_min, EI_min, step)
+        best_vf, best_objective = _search_n_materials(
+            filaments, materials, total_height, objective,
+            E_min, sigma_min, EI_min, step)
         # Fallback: equal distribution
         if best_vf is None:
             best_vf = {f: 1.0 / len(filaments) for f in filaments}
@@ -305,10 +306,51 @@ def generate_gradient_transition(mat1_filament: int, mat2_filament: int,
 
 def _search_n_materials(filaments, materials, total_height, objective,
                         E_min, sigma_min, EI_min, step):
-    """Grid search for 3+ materials (internal helper)."""
+    """Grid search for 3+ materials (internal helper).
+
+    Returns
+    -------
+    tuple of (best_vf, best_objective) or (None, float('inf'))
+    """
     # Simplified: for 3 materials, search v1 and v2, v3 = 1 - v1 - v2
     # This is a placeholder for a proper LP solver
-    pass
+    best_vf = None
+    best_objective = float('inf')
+
+    if len(filaments) == 3:
+        f1, f2, f3 = filaments
+        m1, m2, m3 = materials[f1], materials[f2], materials[f3]
+        for v1_pct in range(0, 101, step):
+            for v2_pct in range(0, 101 - v1_pct, step):
+                v1 = v1_pct / 100.0
+                v2 = v2_pct / 100.0
+                v3 = 1.0 - v1 - v2
+                vf = {f1: v1, f2: v2, f3: v3}
+                mats = {f1: m1, f2: m2, f3: m3}
+
+                E_eff = sum(vf[f] * mats[f].E for f in filaments)
+                sigma_eff = sum(vf[f] * mats[f].sigma_t for f in filaments)
+                rho_eff = sum(vf[f] * mats[f].density for f in filaments)
+                EI_eff = E_eff * total_height**3 / 12.0
+
+                if E_min is not None and E_eff < E_min:
+                    continue
+                if sigma_min is not None and sigma_eff < sigma_min:
+                    continue
+                if EI_min is not None and EI_eff < EI_min:
+                    continue
+
+                if objective == 'weight':
+                    obj = rho_eff * total_height
+                else:
+                    cost_eff = sum(vf[f] * mats[f].cost_per_kg * mats[f].density for f in filaments)
+                    obj = cost_eff * total_height
+
+                if obj < best_objective:
+                    best_objective = obj
+                    best_vf = dict(vf)
+
+    return best_vf, best_objective
 
 
 def _print_optimization_report(result, materials, objective, E_min, sigma_min):

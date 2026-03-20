@@ -99,11 +99,11 @@ def parse_move(line: str) -> Optional[GcodeMove]:
 
     move = GcodeMove()
 
-    x_match = re.search(r'X([\d.]+)', stripped, re.IGNORECASE)
-    y_match = re.search(r'Y([\d.]+)', stripped, re.IGNORECASE)
-    z_match = re.search(r'Z([\d.]+)', stripped, re.IGNORECASE)
-    e_match = re.search(r'E([\d.]+)', stripped, re.IGNORECASE)
-    f_match = re.search(r'F(\d+)', stripped, re.IGNORECASE)
+    x_match = re.search(r'X(-?[\d.]+)', stripped, re.IGNORECASE)
+    y_match = re.search(r'Y(-?[\d.]+)', stripped, re.IGNORECASE)
+    z_match = re.search(r'Z(-?[\d.]+)', stripped, re.IGNORECASE)
+    e_match = re.search(r'E(-?[\d.]+)', stripped, re.IGNORECASE)
+    f_match = re.search(r'F([\d.]+)', stripped, re.IGNORECASE)
 
     if x_match:
         move.x = float(x_match.group(1))
@@ -114,7 +114,7 @@ def parse_move(line: str) -> Optional[GcodeMove]:
     if e_match:
         move.e = float(e_match.group(1))
     if f_match:
-        move.f = int(f_match.group(1))
+        move.f = int(float(f_match.group(1)))
 
     move.is_travel = (move.e is None or move.e == 0)
     return move

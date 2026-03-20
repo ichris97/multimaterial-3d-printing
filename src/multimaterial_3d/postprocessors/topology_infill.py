@@ -218,7 +218,7 @@ def extract_geometry_from_gcode(gcode_content: str) -> Tuple[np.ndarray, list]:
         xy_points: Nx2 array of XY coordinates from extrusion moves
         z_heights: sorted list of unique Z heights found
     """
-    extrude_pattern = re.compile(r'^G[01]\s+X([\d.]+)\s+Y([\d.]+).*E[\d.]+', re.IGNORECASE)
+    extrude_pattern = re.compile(r'^G[01]\s+X([\d.]+)\s+Y([\d.]+).*E-?[\d.]+', re.IGNORECASE)
     z_pattern = re.compile(r';\s*Z_HEIGHT:\s*([\d.]+)')
     wall_pattern = re.compile(r';\s*FEATURE:\s*(Inner|Outer)\s*wall', re.IGNORECASE)
     infill_pattern = re.compile(r';\s*FEATURE:\s*(Sparse|Internal|Solid)\s*infill', re.IGNORECASE)
@@ -415,7 +415,7 @@ def modify_infill_density(gcode_lines: List[str], stress_map: np.ndarray,
     other_feature = re.compile(r';\s*FEATURE:\s*(?!Sparse infill)', re.IGNORECASE)
     z_pattern = re.compile(r';\s*Z_HEIGHT:\s*([\d.]+)')
     move_pattern = re.compile(r'^G1\s+X([\d.]+)\s+Y([\d.]+)', re.IGNORECASE)
-    extrude_pattern = re.compile(r'^G1\s+X([\d.]+)\s+Y([\d.]+)\s+.*E([\d.]+)', re.IGNORECASE)
+    extrude_pattern = re.compile(r'^G1\s+X([\d.]+)\s+Y([\d.]+)\s+.*E(-?[\d.]+)', re.IGNORECASE)
 
     in_infill = False
     infill_lines = []
@@ -457,7 +457,7 @@ def _process_infill_region(infill_lines: List[str], stress_map: np.ndarray,
     """Add reinforcement passes to a single infill region."""
     output = []
     move_pattern = re.compile(r'^G1\s+X([\d.]+)\s+Y([\d.]+)', re.IGNORECASE)
-    extrude_pattern = re.compile(r'^G1\s+X([\d.]+)\s+Y([\d.]+)\s+.*E([\d.]+)', re.IGNORECASE)
+    extrude_pattern = re.compile(r'^G1\s+X([\d.]+)\s+Y([\d.]+)\s+.*E(-?[\d.]+)', re.IGNORECASE)
 
     prev_x, prev_y = None, None
     stress_threshold = 0.20

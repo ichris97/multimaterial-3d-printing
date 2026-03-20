@@ -400,7 +400,7 @@ def generate_output(header: List[str], layers: List[Layer], footer: List[str],
                     output.append(line)
 
             # Return to nominal layer Z
-            output.append(f"G1 Z{layer.z_height:.3f} F600 ; Interlocking Z\n")
+            output.append(f"G1 Z{layer.z_height:.3f} F600 ; Return to nominal Z\n")
             output.append("; === END INTERLOCKING ===\n")
 
         output.extend(layer.post_walls)

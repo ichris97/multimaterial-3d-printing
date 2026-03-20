@@ -59,7 +59,7 @@ def estimate_print_time(gcode_content: str,
         'filament_usage_g': estimated filament weight in grams per material.
     """
     # Parse G-code for moves
-    x, y, z = 0.0, 0.0, 0.0
+    x, y, z, e = 0.0, 0.0, 0.0, 0.0
     current_f = 3000  # mm/min
     travel_time = 0.0
     print_time = 0.0
@@ -222,18 +222,24 @@ def estimate_cost(gcode_content: str, material_map: Dict[int, str],
     weight_by_tool = {}
     total_cost = 0.0
 
-    for tool, length_mm in time_result.get('filament_usage_g', {}).items():
+    # Get per-tool filament lengths from the internal data
+    # We need to re-parse to get lengths; estimate_print_time stores weights
+    # but we need lengths. Re-run to get the raw data.
+    filament_by_tool_length = {}
+    # Reconstruct filament lengths from weights using PLA density assumption
+    for tool, weight_g in time_result.get('filament_usage_g', {}).items():
+        # Reverse: weight_g = cross_section * length / 1000 * 1.24
+        # So length = weight_g * 1000 / (cross_section * 1.24)
+        length_mm = weight_g * 1000.0 / (cross_section * 1.24)
+        filament_by_tool_length[tool] = length_mm
+
+    for tool, length_mm in filament_by_tool_length.items():
         # Look up material for this tool
         mat_key = material_map.get(tool, 'PLA')
         mat = get_material(mat_key)
 
-        # Recalculate weight with correct density
-        # Note: filament_usage_g used PLA density; recalculate here
-        length = 0
-        for t, l in enumerate(time_result.get('filament_usage_mm', {})):
-            pass
-        # Use stored length from the main estimation
-        volume_cm3 = cross_section * length_mm / 1000.0 / mat.density * 1.24
+        # Calculate weight with correct material density
+        volume_cm3 = cross_section * length_mm / 1000.0  # mm^2 * mm / 1000 = cm^3
         weight_g = volume_cm3 * mat.density
         cost = weight_g * mat.cost_per_kg / 1000.0
 

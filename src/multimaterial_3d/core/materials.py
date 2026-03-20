@@ -313,7 +313,7 @@ def get_material(key: str) -> MaterialProperties:
 
 def list_materials() -> None:
     """Print a formatted table of all available materials and key properties."""
-    print(f"{'Key':<10} {'Name':<40} {'E(MPa)':<8} {'σt(MPa)':<8} {'ρ(g/cm³)':<8} {'CTE(1/K)':<12} {'$/kg':<6}")
+    print(f"{'Key':<10} {'Name':<40} {'E(MPa)':<8} {'st(MPa)':<8} {'d(g/cm3)':<8} {'CTE(1/K)':<12} {'$/kg':<6}")
     print("-" * 92)
     for key, mat in sorted(MATERIAL_DB.items()):
         print(f"{key:<10} {mat.name:<40} {mat.E:<8.0f} {mat.sigma_t:<8.0f} {mat.density:<8.2f} {mat.CTE:<12.1e} {mat.cost_per_kg:<6.0f}")
@@ -339,4 +339,4 @@ def get_adhesion(mat1: str, mat2: str) -> dict:
         return {'score': 5, 'note': 'Same material, perfect adhesion'}
     if pair in ADHESION_MATRIX:
         return ADHESION_MATRIX[pair]
-    return {'score': None, 'note': f'No data for {pair[0]}+{pair[1]} — test adhesion before production use'}
+    return {'score': None, 'note': f'No data for {pair[0]}+{pair[1]} -- test adhesion before production use'}
