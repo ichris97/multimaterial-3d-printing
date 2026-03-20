@@ -240,7 +240,22 @@ MATERIAL_COLORS = [
     '#b4befe',  # lavender — material 8
 ]
 
-# Feature colors for G-code visualization
+# Feature names and colors for G-code visualization (index-matched)
+FEATURE_NAMES = [
+    'Outer Wall',      # 0
+    'Inner Wall',      # 1
+    'Sparse Infill',   # 2
+    'Solid Infill',    # 3
+    'Bridge',          # 4
+    'Support',         # 5
+    'Overhang Wall',   # 6
+    'Top Surface',     # 7
+    'Bottom Surface',  # 8
+    'Prime Tower',     # 9
+    'Custom',          # 10
+    'Skirt',           # 11
+]
+
 FEATURE_COLORS = [
     [0.94, 0.55, 0.55],  # outer wall — red
     [0.55, 0.75, 0.94],  # inner wall — blue
@@ -254,4 +269,10 @@ FEATURE_COLORS = [
     [0.85, 0.85, 0.55],  # prime tower — dark yellow
     [0.60, 0.60, 0.60],  # custom — dim gray
     [0.80, 0.55, 0.70],  # skirt — pink
+]
+
+# Hex versions for Qt legend labels
+FEATURE_COLORS_HEX = [
+    '#f08c8c', '#8cbff0', '#8cf08c', '#f0f08c', '#f08cf0', '#b3b3b3',
+    '#f0bf8c', '#8cf0f0', '#bf8cf0', '#d9d98c', '#999999', '#cc8cb3',
 ]

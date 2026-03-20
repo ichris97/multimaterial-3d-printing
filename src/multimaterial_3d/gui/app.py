@@ -32,7 +32,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QAction, QFont
 
-from .theme import DARK_STYLESHEET, COLORS, MATERIAL_COLORS, FEATURE_COLORS
+from .theme import (
+    DARK_STYLESHEET, COLORS, MATERIAL_COLORS, FEATURE_COLORS,
+    FEATURE_NAMES, FEATURE_COLORS_HEX,
+)
 from .viewer_3d import (
     load_mesh_from_3mf, color_mesh_by_layers, parse_gcode_paths
 )
@@ -62,7 +65,7 @@ class WorkerThread(QThread):
 
 
 class ViewerPanel(QWidget):
-    """Side-by-side 3D viewer with before/after comparison."""
+    """Side-by-side 3D viewer with before/after comparison and legends."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -90,6 +93,14 @@ class ViewerPanel(QWidget):
         splitter.setSizes([500, 500])
         layout.addWidget(splitter, stretch=1)
 
+        # Legend area (below viewports, above slider)
+        self.legend_widget = QWidget()
+        self.legend_layout = QHBoxLayout(self.legend_widget)
+        self.legend_layout.setContentsMargins(4, 2, 4, 2)
+        self.legend_layout.setSpacing(12)
+        self.legend_widget.setVisible(False)
+        layout.addWidget(self.legend_widget)
+
         # Layer slider
         slider_layout = QHBoxLayout()
         slider_layout.addWidget(QLabel("Layer:"))
@@ -109,14 +120,74 @@ class ViewerPanel(QWidget):
 
         self.layer_slider.valueChanged.connect(self._on_layer_change)
 
-        # Initialize plotters with background color
+        # Initialize plotters
         for p in [self.plotter_before, self.plotter_after]:
             p.set_background('#181825')
-            p.add_text("Drop a 3MF file or use Import",
+            p.add_text("Import a 3MF file to begin",
                        position='upper_left', font_size=10, color='#6c7086')
 
+    def _set_legend(self, legend_type: str, items: dict = None):
+        """Update the legend bar below the viewports.
+
+        legend_type: 'layer', 'material', 'gcode_feature', 'none'
+        items: dict of {label: color_hex} for material legend
+        """
+        # Clear existing legend items
+        while self.legend_layout.count():
+            child = self.legend_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        if legend_type == 'none':
+            self.legend_widget.setVisible(False)
+            return
+
+        self.legend_widget.setVisible(True)
+
+        if legend_type == 'layer':
+            title = QLabel("Color: Layer height (blue=bottom, red=top)")
+            title.setStyleSheet("color: #a6adc8; font-size: 11px; background: transparent;")
+            self.legend_layout.addWidget(title)
+            self.legend_layout.addStretch()
+
+        elif legend_type == 'material' and items:
+            title = QLabel("Materials:")
+            title.setStyleSheet("color: #a6adc8; font-size: 11px; font-weight: bold; background: transparent;")
+            self.legend_layout.addWidget(title)
+            for label, color in items.items():
+                swatch = QLabel("  ")
+                swatch.setFixedSize(14, 14)
+                swatch.setStyleSheet(
+                    f"background-color: {color}; border-radius: 3px; border: 1px solid #585b70;")
+                name = QLabel(label)
+                name.setStyleSheet("color: #cdd6f4; font-size: 11px; background: transparent;")
+                self.legend_layout.addWidget(swatch)
+                self.legend_layout.addWidget(name)
+            self.legend_layout.addStretch()
+
+        elif legend_type == 'gcode_feature':
+            title = QLabel("G-code Features:")
+            title.setStyleSheet("color: #a6adc8; font-size: 11px; font-weight: bold; background: transparent;")
+            self.legend_layout.addWidget(title)
+            # Only show features that are present in current gcode
+            present = set()
+            if self._gcode_mesh is not None and 'feature' in self._gcode_mesh.cell_data:
+                present = set(self._gcode_mesh.cell_data['feature'])
+            for idx in sorted(present):
+                if idx < len(FEATURE_NAMES):
+                    swatch = QLabel("  ")
+                    swatch.setFixedSize(14, 14)
+                    swatch.setStyleSheet(
+                        f"background-color: {FEATURE_COLORS_HEX[idx]}; "
+                        f"border-radius: 3px; border: 1px solid #585b70;")
+                    name = QLabel(FEATURE_NAMES[idx])
+                    name.setStyleSheet("color: #cdd6f4; font-size: 11px; background: transparent;")
+                    self.legend_layout.addWidget(swatch)
+                    self.legend_layout.addWidget(name)
+            self.legend_layout.addStretch()
+
     def show_mesh(self, mesh: pv.PolyData, target='before', scalars=None,
-                  cmap=None, title=None):
+                  cmap=None, title=None, material_legend: dict = None):
         """Display a mesh in the before or after viewport."""
         plotter = self.plotter_before if target == 'before' else self.plotter_after
         plotter.clear()
@@ -129,7 +200,7 @@ class ViewerPanel(QWidget):
         if scalars and scalars in mesh.cell_data:
             kwargs['scalars'] = scalars
             kwargs['cmap'] = cmap or 'turbo'
-            kwargs['show_scalar_bar'] = True
+            kwargs['show_scalar_bar'] = False  # We use our own legend instead
         else:
             kwargs['color'] = '#b4befe'
 
@@ -150,8 +221,14 @@ class ViewerPanel(QWidget):
             self.layer_slider.setRange(0, self._max_layer)
             self.layer_slider.setValue(self._max_layer)
 
-    def show_gcode(self, gcode_mesh: pv.PolyData, target='after'):
-        """Display parsed G-code paths in a viewport."""
+        # Set legend
+        if material_legend:
+            self._set_legend('material', material_legend)
+        elif scalars == 'layer':
+            self._set_legend('layer')
+
+    def show_gcode(self, gcode_mesh: pv.PolyData, target='after', title=None):
+        """Display parsed G-code paths in a viewport with feature legend."""
         plotter = self.plotter_after if target == 'after' else self.plotter_before
         plotter.clear()
         plotter.set_background('#181825')
@@ -160,6 +237,11 @@ class ViewerPanel(QWidget):
             return
 
         self._gcode_mesh = gcode_mesh
+        if target == 'after':
+            self._mesh_after = None  # Clear mesh reference so slider uses gcode
+        else:
+            self._mesh_before = None
+
         if 'layer' in gcode_mesh.cell_data:
             self._max_layer = int(gcode_mesh.cell_data['layer'].max())
             self.layer_slider.setRange(0, self._max_layer)
@@ -168,9 +250,12 @@ class ViewerPanel(QWidget):
         plotter.add_mesh(gcode_mesh, scalars='feature', cmap=FEATURE_COLORS,
                          line_width=1.5, render_lines_as_tubes=False,
                          show_scalar_bar=False)
-        plotter.add_text("G-code Preview", position='upper_left',
+        plotter.add_text(title or "G-code Preview", position='upper_left',
                          font_size=10, color='#cdd6f4')
         plotter.reset_camera()
+
+        # Show feature legend
+        self._set_legend('gcode_feature')
 
     def _on_layer_change(self, value):
         """Filter displayed geometry by layer."""
@@ -179,7 +264,7 @@ class ViewerPanel(QWidget):
         else:
             self.layer_label.setText(str(value))
 
-        # Re-render with layer filter
+        # Re-render meshes with layer filter
         for mesh, plotter, label in [
             (self._mesh_before, self.plotter_before, "Original"),
             (self._mesh_after, self.plotter_after, "Modified"),
@@ -194,7 +279,7 @@ class ViewerPanel(QWidget):
                     if 'material' in filtered.cell_data:
                         kwargs['scalars'] = 'material'
                         kwargs['cmap'] = MATERIAL_COLORS[:8]
-                        kwargs['show_scalar_bar'] = True
+                        kwargs['show_scalar_bar'] = False
                     elif 'layer' in filtered.cell_data:
                         kwargs['scalars'] = 'layer'
                         kwargs['cmap'] = 'turbo'
@@ -204,6 +289,28 @@ class ViewerPanel(QWidget):
                     plotter.add_mesh(filtered, **kwargs)
                     plotter.add_text(label, position='upper_left',
                                      font_size=10, color='#cdd6f4')
+
+        # Re-render G-code with layer filter
+        if self._gcode_mesh is not None and 'layer' in self._gcode_mesh.cell_data:
+            # Determine which plotter has the gcode
+            if self._mesh_after is None:
+                plotter = self.plotter_after
+                label = "G-code"
+            elif self._mesh_before is None:
+                plotter = self.plotter_before
+                label = "G-code"
+            else:
+                return  # Both have meshes, gcode not shown
+
+            plotter.clear()
+            plotter.set_background('#181825')
+            mask = self._gcode_mesh.cell_data['layer'] <= value
+            if mask.any():
+                filtered = self._gcode_mesh.extract_cells(np.where(mask)[0])
+                plotter.add_mesh(filtered, scalars='feature', cmap=FEATURE_COLORS,
+                                 line_width=1.5, show_scalar_bar=False)
+                plotter.add_text(label, position='upper_left',
+                                 font_size=10, color='#cdd6f4')
 
     def close(self):
         self.plotter_before.close()
@@ -634,41 +741,84 @@ class MainWindow(QMainWindow):
         self._log(f"Loading: {path}")
 
         try:
-            mesh = load_mesh_from_3mf(path)
-            self._log(f"  Mesh: {mesh.n_points} vertices, {mesh.n_cells} faces")
-
-            # Auto-detect height for the layer panel
-            z_range = mesh.bounds[5] - mesh.bounds[4]
-            self.layer_panel.total_height.setValue(round(z_range, 1))
-            self.analysis_panel.total_height.setValue(round(z_range, 1))
-
-            # Color by layer and show
-            lh = self.layer_panel.layer_height.value()
-            mesh = color_mesh_by_layers(mesh, lh)
-            self.viewer.show_mesh(mesh, target='before', scalars='layer',
-                                  cmap='turbo', title='Original')
+            # Try to load mesh geometry
+            mesh = None
+            try:
+                mesh = load_mesh_from_3mf(path)
+                self._log(f"  Mesh: {mesh.n_points} vertices, {mesh.n_cells} faces")
+            except Exception:
+                self._log("  No mesh geometry in file (sliced-only 3MF).")
 
             # Check for G-code
-            has_gcode = False
+            gcode_content = None
+            gcode_path_in_zip = None
             with zipfile.ZipFile(path, 'r') as zf:
                 for name in zf.namelist():
                     if name.endswith('.gcode'):
-                        has_gcode = True
                         gcode_content = zf.read(name).decode('utf-8')
+                        gcode_path_in_zip = name
                         self._log(f"  G-code found: {name}")
-                        # Parse and show G-code preview (first 100 layers for speed)
-                        gcode_mesh = parse_gcode_paths(gcode_content, max_layers=100)
-                        if gcode_mesh:
-                            self.viewer.show_gcode(gcode_mesh, target='after')
-                            self._log(f"  G-code paths: {gcode_mesh.n_cells} segments")
                         break
 
-            if not has_gcode:
-                self._log("  No G-code (unsliced). Layer Pattern and Analysis available.")
-                self.viewer.show_mesh(mesh.copy(), target='after', scalars='layer',
-                                      cmap='turbo', title='Preview')
+            lh = self.layer_panel.layer_height.value()
 
-            self.status.showMessage(f"Loaded: {Path(path).name} ({mesh.n_cells} faces)")
+            if mesh is not None and mesh.n_cells > 0:
+                # Auto-detect height
+                z_range = mesh.bounds[5] - mesh.bounds[4]
+                self.layer_panel.total_height.setValue(round(z_range, 1))
+                self.analysis_panel.total_height.setValue(round(z_range, 1))
+
+                # Color by layer and show in left viewport
+                mesh = color_mesh_by_layers(mesh, lh)
+                self.viewer.show_mesh(mesh, target='before', scalars='layer',
+                                      cmap='turbo', title='Original Model')
+
+                if gcode_content:
+                    # Show G-code in right viewport
+                    gcode_mesh = parse_gcode_paths(gcode_content, max_layers=150)
+                    if gcode_mesh:
+                        self.viewer.show_gcode(gcode_mesh, target='after',
+                                               title='Sliced G-code')
+                        self._log(f"  G-code: {gcode_mesh.n_cells} path segments")
+                else:
+                    # No G-code: mirror mesh in right viewport
+                    self._log("  No G-code (unsliced). Layer Pattern and Analysis available.")
+                    self.viewer.show_mesh(mesh.copy(), target='after', scalars='layer',
+                                          cmap='turbo', title='Preview')
+
+                self.status.showMessage(
+                    f"Loaded: {Path(path).name} ({mesh.n_cells} faces)")
+
+            elif gcode_content:
+                # Gcode-only 3MF (no mesh geometry) — show G-code in BOTH viewports
+                self._log("  Sliced-only file: showing G-code paths.")
+                gcode_mesh = parse_gcode_paths(gcode_content, max_layers=150)
+                if gcode_mesh:
+                    # Detect height from G-code Z range
+                    if 'layer' in gcode_mesh.cell_data:
+                        z_vals = gcode_mesh.points[:, 2]
+                        z_range = z_vals.max() - z_vals.min()
+                        self.layer_panel.total_height.setValue(round(z_range, 1))
+                        self.analysis_panel.total_height.setValue(round(z_range, 1))
+
+                    self.viewer.show_gcode(gcode_mesh, target='before',
+                                           title='Original G-code')
+                    self.viewer.show_gcode(gcode_mesh, target='after',
+                                           title='G-code (apply a tool to modify)')
+                    self._log(f"  G-code: {gcode_mesh.n_cells} path segments, "
+                              f"{int(gcode_mesh.cell_data['layer'].max())} layers")
+                    self.status.showMessage(
+                        f"Loaded: {Path(path).name} (sliced, "
+                        f"{gcode_mesh.n_cells} G-code segments)")
+                else:
+                    self._log("  ERROR: Could not parse G-code paths.")
+                    self.status.showMessage("Error: No parseable content in file.")
+            else:
+                self._log("  ERROR: File contains neither mesh nor G-code.")
+                self.status.showMessage("Error: Empty 3MF file.")
+                QMessageBox.warning(self, "Import Error",
+                    "This 3MF file contains no mesh geometry and no G-code.\n"
+                    "Please use a valid model or sliced file.")
 
         except Exception as e:
             self._log(f"Error loading file: {e}")
@@ -793,14 +943,33 @@ class MainWindow(QMainWindow):
             inject_layer_config(self._input_path, output, xml)
             self._log(f"Created: {output}")
 
-            # Show colored mesh
-            mesh = load_mesh_from_3mf(self._input_path)
+            # Show colored mesh with material legend
+            try:
+                mesh = load_mesh_from_3mf(self._input_path)
+            except Exception:
+                mesh = None
+
             material_map = {1: params['mat1'], 2: params['mat2']}
-            mesh = color_mesh_by_layers(mesh, params['layer_height'],
-                                        pattern=pattern, material_map=material_map)
-            self.viewer.show_mesh(mesh, target='after', scalars='material',
-                                  cmap=MATERIAL_COLORS[:len(set(pattern))],
-                                  title=f"Pattern: {params['pattern']}")
+
+            if mesh is not None:
+                mesh = color_mesh_by_layers(mesh, params['layer_height'],
+                                            pattern=pattern, material_map=material_map)
+                # Build legend: {display_name: color_hex}
+                from ..core.materials import get_material
+                legend_items = {}
+                unique_mats = sorted(set(pattern))
+                for i, f in enumerate(unique_mats):
+                    mat_key = material_map.get(f, 'PLA')
+                    mat = get_material(mat_key)
+                    color = MATERIAL_COLORS[i % len(MATERIAL_COLORS)]
+                    legend_items[f"F{f}: {mat.name}"] = color
+
+                self.viewer.show_mesh(mesh, target='after', scalars='material',
+                                      cmap=MATERIAL_COLORS[:len(unique_mats)],
+                                      title=f"Pattern: {params['pattern']}",
+                                      material_legend=legend_items)
+            else:
+                self._log("  No mesh to visualize (sliced-only file).")
 
             if params['analyze']:
                 buf = io.StringIO()
