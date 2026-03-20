@@ -33,7 +33,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QAction, QFont
 
 from .theme import (
-    DARK_STYLESHEET, COLORS, MATERIAL_COLORS, FEATURE_COLORS,
+    DARK_STYLESHEET, COLORS, MATERIAL_COLORS,
     FEATURE_NAMES, FEATURE_COLORS_HEX,
 )
 from .viewer_3d import (
@@ -247,7 +247,7 @@ class ViewerPanel(QWidget):
             self.layer_slider.setRange(0, self._max_layer)
             self.layer_slider.setValue(self._max_layer)
 
-        plotter.add_mesh(gcode_mesh, scalars='feature', cmap=FEATURE_COLORS,
+        plotter.add_mesh(gcode_mesh, scalars='feature', cmap=FEATURE_COLORS_HEX,
                          line_width=1.5, render_lines_as_tubes=False,
                          show_scalar_bar=False)
         plotter.add_text(title or "G-code Preview", position='upper_left',
@@ -307,7 +307,7 @@ class ViewerPanel(QWidget):
             mask = self._gcode_mesh.cell_data['layer'] <= value
             if mask.any():
                 filtered = self._gcode_mesh.extract_cells(np.where(mask)[0])
-                plotter.add_mesh(filtered, scalars='feature', cmap=FEATURE_COLORS,
+                plotter.add_mesh(filtered, scalars='feature', cmap=FEATURE_COLORS_HEX,
                                  line_width=1.5, show_scalar_bar=False)
                 plotter.add_text(label, position='upper_left',
                                  font_size=10, color='#cdd6f4')
