@@ -91,7 +91,7 @@ def thermal_stress_analysis(pattern: List[int], layer_height: float,
         - 'warp_deflection': predicted warping at part edges (mm)
         - 'risk_level': 'low', 'moderate', or 'high'
     """
-    num_layers = int(total_height / layer_height)
+    num_layers = round(total_height / layer_height)
     pattern_len = len(pattern)
 
     # Build the full layer stack
@@ -123,8 +123,8 @@ def thermal_stress_analysis(pattern: List[int], layer_height: float,
         if delta_T <= 0:
             continue  # No thermal stress if Tg below room temperature
 
-        # CTE mismatch
-        delta_alpha = abs(mat_top.CTE - mat_bot.CTE)
+        # CTE mismatch (signed: positive means top expands more than bottom)
+        delta_alpha = mat_top.CTE - mat_bot.CTE
         thermal_strain = delta_alpha * delta_T
 
         h1 = layer_height  # bottom layer
@@ -144,17 +144,20 @@ def thermal_stress_analysis(pattern: List[int], layer_height: float,
         # The total thermal force mismatch is distributed between layers
         # inversely proportional to their axial rigidity.
         #
-        # sigma_1 = delta_alpha * delta_T * E1_bar * E2_bar * h2 /
-        #           (E1_bar * h1 + E2_bar * h2)
-        # sigma_2 = delta_alpha * delta_T * E1_bar * E2_bar * h1 /
-        #           (E1_bar * h1 + E2_bar * h2)
+        # Using signed delta_alpha: if alpha_top > alpha_bot, then on
+        # cooling (dT > 0 from Tg to room), the top material wants to
+        # shrink more and is put in tension; the bottom in compression.
+        # sigma_1 (bottom) is compressive (negative), sigma_2 (top) is tensile.
         #
-        # These are the membrane stresses in each layer. The stress in
-        # the material with higher CTE is tensile (it wants to shrink
-        # more but is constrained); the other is compressive.
-        sigma_1 = thermal_strain * E1_bar * E2_bar * h2 / (E1_bar * h1 + E2_bar * h2)
+        # Force balance: sigma_1*h1 + sigma_2*h2 = 0
+        # Compatibility: sigma_1/E1_bar - sigma_2/E2_bar = delta_alpha*delta_T
+        #
+        # Solving:
+        #   sigma_1 = -delta_alpha*dT * E1_bar*E2_bar*h2 / (E1_bar*h1 + E2_bar*h2)
+        #   sigma_2 = +delta_alpha*dT * E1_bar*E2_bar*h1 / (E1_bar*h1 + E2_bar*h2)
+        sigma_1 = -thermal_strain * E1_bar * E2_bar * h2 / (E1_bar * h1 + E2_bar * h2)
         sigma_2 = thermal_strain * E1_bar * E2_bar * h1 / (E1_bar * h1 + E2_bar * h2)
-        sigma_normal = max(sigma_1, sigma_2)
+        sigma_normal = max(abs(sigma_1), abs(sigma_2))
 
         # ── Interfacial shear stress (Suhir model) ───────────────────
         # Suhir (1989) showed that the interfacial shear stress in a
@@ -184,7 +187,11 @@ def thermal_stress_analysis(pattern: List[int], layer_height: float,
         compliance_sum = 1.0 / (E1_bar * h1) + 1.0 / (E2_bar * h2)
         beta = np.sqrt(K_shear * compliance_sum)
 
-        tau_max = thermal_strain * beta / compliance_sum
+        # Note: tau_max is the magnitude of the peak shear stress at the
+        # free edge. The Suhir formula assumes an infinite strip (L >> 1/beta),
+        # i.e., coth(beta*L/2) -> 1. This is reasonable for most 3D printed parts
+        # where part dimensions are much larger than the shear transfer length 1/beta.
+        tau_max = abs(thermal_strain) * beta / compliance_sum
 
         # ── Timoshenko curvature for this bilayer ────────────────────
         # Classic Timoshenko (1925) formula for bilayer curvature:
@@ -203,9 +210,11 @@ def thermal_stress_analysis(pattern: List[int], layer_height: float,
             'mat_bottom': mat_bot.name,
             'mat_top': mat_top.name,
             'delta_T': delta_T,
-            'delta_alpha': delta_alpha,
-            'thermal_strain': thermal_strain,
-            'sigma_normal': sigma_normal,
+            'delta_alpha': delta_alpha,  # signed: top CTE - bottom CTE
+            'thermal_strain': thermal_strain,  # signed
+            'sigma_bot': sigma_1,  # signed stress in bottom layer (MPa)
+            'sigma_top': sigma_2,  # signed stress in top layer (MPa)
+            'sigma_normal': sigma_normal,  # max absolute value for risk assessment
             'tau_max': tau_max,
             'kappa_local': kappa_local,
             'beta': beta,

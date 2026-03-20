@@ -247,7 +247,10 @@ def compute_layer_stiffness_matrix(mat: MaterialProperties,
     Q_mat = compute_orthotropic_stiffness(mat)
 
     if quasi_isotropic:
-        # Average 0 and 90 degree orientations for balanced laminate
+        # Average 0 and 90 degree orientations for balanced symmetric laminate
+        # Note: this is NOT truly quasi-isotropic (which requires 0/45/-45/90).
+        # A balanced 0/90 average gives E_x = E_y but G_xy differs from the
+        # true quasi-isotropic value.
         Q_0 = Q_mat
         Q_90 = rotate_stiffness_matrix(Q_mat, 90.0)
         return 0.5 * (Q_0 + Q_90)
@@ -464,9 +467,10 @@ def compute_hashin_shtrikman_bounds(mat1: MaterialProperties, mat2: MaterialProp
     else:
         G_lower = G2
 
-    # Convert back to E, nu
-    E_upper = 9 * K_upper * G_upper / (3 * K_upper + G_upper)
-    E_lower = 9 * K_lower * G_lower / (3 * K_lower + G_lower)
+    # Convert back to E using plane stress relation: E = 4*K*G / (K + G)
+    # Note: E = 9KG/(3K+G) is for 3D bulk modulus; we use plane stress K here
+    E_upper = 4.0 * K_upper * G_upper / (K_upper + G_upper)
+    E_lower = 4.0 * K_lower * G_lower / (K_lower + G_lower)
 
     return {
         'E_HS_upper': E_upper, 'E_HS_lower': E_lower,
@@ -524,7 +528,12 @@ def compute_interlaminar_shear(abd_results: dict, pattern: List[int],
     num_layers = int(total_height / layer_height)
     pattern_len = len(pattern)
     z_neutral = abd_results['z_neutral']
-    EI = abd_results['EI_eff']
+    # EI about the neutral axis, not the midplane. For asymmetric layups,
+    # D[0,0] is about the midplane; the correct EI_NA = D11 - B11^2/A11.
+    A11 = abd_results['A'][0, 0]
+    B11 = abd_results['B'][0, 0]
+    D11 = abd_results['D'][0, 0]
+    EI = D11 - B11**2 / A11 if A11 > 0 else D11
 
     if EI <= 0:
         return []
@@ -637,8 +646,13 @@ def compute_tsai_wu_failure(pattern: List[int], layer_height: float,
         strain = eps0 + kappa * z_mid
 
         # Stress in laminate coordinates
-        stress = Q @ strain
-        s1, s2, t12 = stress[0], stress[1], stress[2]
+        stress_laminate = Q @ strain
+
+        # Transform stress from laminate coordinates to material coordinates
+        # for Tsai-Wu evaluation. For quasi-isotropic (0/90 averaged) layers,
+        # material and laminate axes are effectively aligned, so no transform.
+        # For layers with a specific raster angle, we must rotate back.
+        s1, s2, t12 = stress_laminate[0], stress_laminate[1], stress_laminate[2]
 
         # Tsai-Wu strength parameters
         aniso = FDM_ANISOTROPY_RATIO.get(mat.category, 0.85)
