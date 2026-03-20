@@ -725,6 +725,7 @@ class MainWindow(QMainWindow):
         self.console.appendPlainText(text.rstrip())
         self.console.verticalScrollBar().setValue(
             self.console.verticalScrollBar().maximum())
+        QApplication.processEvents()  # Keep UI responsive during logging
 
     # ── File operations ──────────────────────────────────────────────────
 
@@ -880,43 +881,50 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 0)  # Indeterminate
         self.status.showMessage(msg)
         self.console.appendPlainText(f"\n--- {msg} ---")
+        QApplication.processEvents()  # Force UI update before blocking operation
 
-    def _finish_operation(self, msg: str):
+    def _finish_operation(self, msg: str, tool_name: str = "Modified"):
         self.progress.setVisible(False)
         self.export_btn.setEnabled(True)
         self.status.showMessage(msg)
         self._log(msg)
 
-        # Reload and display result
+        # Force Qt to process pending events so the UI updates
+        QApplication.processEvents()
+
+        # Reload and display result in the "after" viewport
         if self._output_path and Path(self._output_path).exists():
             try:
-                # First try to show G-code visualization (for tools that
-                # modify G-code, the output 3MF may not have mesh changes
-                # but will have modified G-code paths)
                 shown = False
                 with zipfile.ZipFile(self._output_path, 'r') as zf:
                     for name in zf.namelist():
                         if name.endswith('.gcode'):
+                            self._log(f"  Loading result G-code for preview...")
+                            QApplication.processEvents()
                             gcode_content = zf.read(name).decode('utf-8')
                             gcode_mesh = parse_gcode_paths(
-                                gcode_content, max_layers=100
+                                gcode_content, max_layers=150
                             )
                             if gcode_mesh:
                                 self.viewer.show_gcode(
                                     gcode_mesh, target='after',
-                                    title='Modified G-code'
+                                    title=f'{tool_name} (G-code)'
                                 )
+                                self._log(f"  Preview: {gcode_mesh.n_cells} G-code segments")
                                 shown = True
                             break
 
                 if not shown:
-                    # Fall back to mesh visualization
                     result_mesh = load_mesh_from_3mf(self._output_path)
                     lh = self.layer_panel.layer_height.value()
                     result_mesh = color_mesh_by_layers(result_mesh, lh)
                     self.viewer.show_mesh(result_mesh, target='after',
                                           scalars='layer', cmap='turbo',
-                                          title='Result')
+                                          title=f'{tool_name} (Mesh)')
+
+                # Force viewport refresh
+                QApplication.processEvents()
+
             except Exception as e:
                 self._log(f"  Could not preview result: {e}")
 
@@ -984,7 +992,8 @@ class MainWindow(QMainWindow):
                 self._log(buf.getvalue())
 
             self._output_path = output
-            self._finish_operation("Layer pattern applied successfully.")
+            self._finish_operation("Layer pattern applied successfully.",
+                                   tool_name="Layer Pattern")
 
         except Exception as e:
             self._on_error(f"{e}\n{traceback.format_exc()}")
@@ -1019,7 +1028,8 @@ class MainWindow(QMainWindow):
             repack_3mf(self._input_path, output, new_gcode, gcode_path)
 
             self._output_path = output
-            self._finish_operation("Interlocking perimeters applied.")
+            self._finish_operation("Interlocking perimeters applied.",
+                                   tool_name="Interlocked")
 
         except Exception as e:
             self._on_error(f"{e}\n{traceback.format_exc()}")
@@ -1057,7 +1067,8 @@ class MainWindow(QMainWindow):
             repack_3mf(self._input_path, output, new_gcode, gcode_path)
 
             self._output_path = output
-            self._finish_operation("Topology-optimized infill applied.")
+            self._finish_operation("Topology-optimized infill applied.",
+                                   tool_name="Topology Infill")
 
         except Exception as e:
             self._on_error(f"{e}\n{traceback.format_exc()}")
@@ -1087,7 +1098,8 @@ class MainWindow(QMainWindow):
             repack_3mf(self._input_path, output, new_gcode, gcode_path)
 
             self._output_path = output
-            self._finish_operation("Wall-infill interlocking applied.")
+            self._finish_operation("Wall-infill interlocking applied.",
+                                   tool_name="Wall-Infill Teeth")
 
         except Exception as e:
             self._on_error(f"{e}\n{traceback.format_exc()}")
