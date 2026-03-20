@@ -107,10 +107,11 @@ src/multimaterial_3d/
         materials.py         # Material database (12 filaments, full property sets)
         file_io.py           # 3MF/G-code read/write/repack utilities
     analysis/
-        mechanical.py        # CLT, ABD matrix, Rule of Mixtures, flexural analysis
-        thermal.py           # Thermal stress, Timoshenko warping, CTE mismatch
+        mechanical.py        # CLT, ABD matrix, Hashin-Shtrikman, Tsai-Wu failure
+        thermal.py           # Timoshenko/Suhir thermal stress, CLT warping
         optimizer.py         # Weight/cost optimization, gradient transitions
         print_estimator.py   # Print time/cost estimation from G-code
+        adaptive_layers.py   # Geometry-based variable layer height
     postprocessors/
         layer_pattern.py     # Per-layer filament assignment in 3MF
         interlocking_perimeters.py  # Z-offset wall interlock
@@ -118,6 +119,10 @@ src/multimaterial_3d/
         wall_infill_interlock.py    # Sinusoidal teeth interlocking
     utils/
         gcode_parser.py      # G-code parsing and feature detection
+samples/
+    inputs/                  # Source 3MF models for testing
+    outputs/                 # Example post-processed results
+archive/                     # Original standalone scripts (pre-refactor)
 ```
 
 ## Material Database
