@@ -114,49 +114,88 @@ def thermal_stress_analysis(pattern: List[int], layer_height: float,
         if mat_bot.name == mat_top.name:
             continue
 
-        # Stress-free temperature: the lower Tg, because above Tg the polymer
-        # relaxes and cannot sustain elastic stress
+        # Stress-free temperature: the lower Tg of the pair.
+        # Above Tg, the polymer chain mobility allows stress relaxation,
+        # so thermal stresses only accumulate below Tg.
         T_stress_free = min(mat_bot.T_glass, mat_top.T_glass)
         delta_T = T_stress_free - T_room
 
         if delta_T <= 0:
-            continue  # No thermal stress if Tg is below room temperature
+            continue  # No thermal stress if Tg below room temperature
 
         # CTE mismatch
         delta_alpha = abs(mat_top.CTE - mat_bot.CTE)
-
-        # Thermal strain mismatch
         thermal_strain = delta_alpha * delta_T
 
-        # ── Interfacial normal stress (peel stress) ──────────────────
-        # From force balance on a constrained bilayer:
-        # Each material wants to shrink differently. The stiffer material
-        # constrains the more expansive one, creating tension in one and
-        # compression in the other.
-        #
-        # σ_thermal ≈ E_eff * Δα * ΔT / (1 + E_top*h_top/(E_bot*h_bot))
-        # For a single-layer interface, we use the harmonic mean modulus
-
-        E_harm = 2 * mat_bot.E * mat_top.E / (mat_bot.E + mat_top.E)
-        sigma_normal = E_harm * thermal_strain
-
-        # ── Interfacial shear stress ─────────────────────────────────
-        # The shear stress is highest at the free edges and decays
-        # exponentially toward the center. For a simple bilayer:
-        #
-        # τ_max ≈ Δα * ΔT * E1 * E2 * h1 * h2 /
-        #         ((E1*h1 + E2*h2) * √(h1*h2)) * correction_factor
-        #
-        # The correction factor accounts for the characteristic shear
-        # transfer length. For thin layers, shear stress is relatively
-        # higher because there's less material to distribute the load.
-
-        h1 = layer_height  # bottom layer thickness
-        h2 = layer_height  # top layer thickness
+        h1 = layer_height  # bottom layer
+        h2 = layer_height  # top layer
         E1, E2 = mat_bot.E, mat_top.E
+        nu1, nu2 = mat_bot.nu, mat_top.nu
 
-        tau_max = (delta_alpha * delta_T * E1 * E2 * h1 * h2 /
-                   ((E1 * h1 + E2 * h2) * np.sqrt(h1 * h2 + 1e-10)))
+        # ── Biaxial plane-stress modulus ─────────────────────────────
+        # In a bonded bilayer, the interface constrains both in-plane
+        # directions. The biaxial modulus E_bar = E / (1 - nu) is the
+        # appropriate stiffness for plane-stress thermal problems.
+        E1_bar = E1 / (1.0 - nu1)
+        E2_bar = E2 / (1.0 - nu2)
+
+        # ── Membrane (axial) stress at interface ─────────────────────
+        # From force equilibrium of a constrained bilayer (Timoshenko):
+        # The total thermal force mismatch is distributed between layers
+        # inversely proportional to their axial rigidity.
+        #
+        # sigma_1 = delta_alpha * delta_T * E1_bar * E2_bar * h2 /
+        #           (E1_bar * h1 + E2_bar * h2)
+        # sigma_2 = delta_alpha * delta_T * E1_bar * E2_bar * h1 /
+        #           (E1_bar * h1 + E2_bar * h2)
+        #
+        # These are the membrane stresses in each layer. The stress in
+        # the material with higher CTE is tensile (it wants to shrink
+        # more but is constrained); the other is compressive.
+        sigma_1 = thermal_strain * E1_bar * E2_bar * h2 / (E1_bar * h1 + E2_bar * h2)
+        sigma_2 = thermal_strain * E1_bar * E2_bar * h1 / (E1_bar * h1 + E2_bar * h2)
+        sigma_normal = max(sigma_1, sigma_2)
+
+        # ── Interfacial shear stress (Suhir model) ───────────────────
+        # Suhir (1989) showed that the interfacial shear stress in a
+        # bonded bilayer decays exponentially from the free edge:
+        #
+        #   tau(x) = tau_max * exp(-beta * x)
+        #
+        # where x is distance from the free edge and beta is the
+        # characteristic shear transfer parameter:
+        #
+        #   beta = sqrt(K_shear * (1/(E1_bar*h1) + 1/(E2_bar*h2)))
+        #
+        # K_shear accounts for the shear compliance of the interface
+        # region. For FDM inter-layer bonds, the bonding zone thickness
+        # is approximately 0.1 * layer_height (the remelted region).
+        #
+        # The maximum shear stress at the free edge is:
+        #   tau_max = delta_alpha * delta_T * beta /
+        #             (1/(E1_bar*h1) + 1/(E2_bar*h2))
+
+        # Effective shear compliance of the interface zone
+        # Bond zone thickness ~ 10% of layer height for typical FDM
+        h_bond = 0.1 * layer_height
+        G_avg = 0.5 * (mat_bot.G_xy + mat_top.G_xy)
+        K_shear = G_avg / h_bond  # Shear stiffness per unit area (MPa/mm)
+
+        compliance_sum = 1.0 / (E1_bar * h1) + 1.0 / (E2_bar * h2)
+        beta = np.sqrt(K_shear * compliance_sum)
+
+        tau_max = thermal_strain * beta / compliance_sum
+
+        # ── Timoshenko curvature for this bilayer ────────────────────
+        # Classic Timoshenko (1925) formula for bilayer curvature:
+        #   kappa = 6*(a2-a1)*dT*(1+m)^2 /
+        #           (h*(3*(1+m)^2 + (1+m*n)*(m^2 + 1/(m*n))))
+        # where m = h1/h2, n = E1/E2, h = h1 + h2
+        m = h1 / h2
+        n = E1 / E2
+        h = h1 + h2
+        kappa_local = (6.0 * delta_alpha * delta_T * (1 + m)**2 /
+                       (h * (3*(1+m)**2 + (1+m*n)*(m**2 + 1.0/(m*n + 1e-20)))))
 
         interface_stresses.append({
             'layer_index': i,
@@ -168,6 +207,8 @@ def thermal_stress_analysis(pattern: List[int], layer_height: float,
             'thermal_strain': thermal_strain,
             'sigma_normal': sigma_normal,
             'tau_max': tau_max,
+            'kappa_local': kappa_local,
+            'beta': beta,
         })
 
         max_shear = max(max_shear, tau_max)
@@ -211,11 +252,23 @@ def thermal_stress_analysis(pattern: List[int], layer_height: float,
 
 def _predict_bilayer_warping(layer_materials: list, layer_height: float,
                               num_layers: int, T_room: float) -> Tuple[float, float]:
-    """Predict warping using generalized Timoshenko bilayer model.
+    """Predict warping using CLT thermal force and moment resultants.
 
-    For a multi-material stack, we compute the effective CTE-weighted
-    curvature by integrating the thermal strain mismatch through the
-    thickness, weighted by the distance from the neutral axis.
+    This uses the proper Classical Laminate Theory approach:
+    1. Compute thermal force resultant N_T and moment resultant M_T
+       by integrating the thermal stress through the thickness.
+    2. Compute the ABD matrix (A, B, D) for the laminate.
+    3. Solve the coupled system [A,B;B,D] * [eps0;kappa] = [N_T;M_T]
+       for the midplane strains eps0 and curvatures kappa.
+
+    For symmetric layups (B=0), N_T produces only membrane strain (no
+    curvature), and M_T=0, so no warping occurs. For asymmetric layups
+    (B!=0), the coupling between extension and bending causes the thermal
+    loads to produce curvature (warping).
+
+    The key physical insight: warping is driven by the B matrix (asymmetry),
+    not just by CTE differences. A symmetric layup with large CTE mismatch
+    will NOT warp (it will have internal stresses but no curvature).
 
     Returns
     -------
@@ -223,45 +276,83 @@ def _predict_bilayer_warping(layer_materials: list, layer_height: float,
         curvature in 1/mm, deflection in mm (assuming 100mm part length).
     """
     h_total = num_layers * layer_height
+    z_ref = h_total / 2.0
 
-    # Compute weighted neutral axis
+    # Build ABD matrix and thermal resultants simultaneously
+    A = np.zeros((3, 3))
+    B = np.zeros((3, 3))
+    D = np.zeros((3, 3))
+    N_T = np.zeros(3)  # Thermal force resultant
+    M_T = np.zeros(3)  # Thermal moment resultant
+
+    for k, mat in enumerate(layer_materials):
+        # Biaxial plane-stress stiffness for thermal analysis
+        E_bar = mat.E / (1.0 - mat.nu)
+        nu = mat.nu
+
+        # Simplified Q matrix (quasi-isotropic for thermal)
+        Q11 = mat.E / (1.0 - nu**2)
+        Q12 = nu * mat.E / (1.0 - nu**2)
+        Q = np.array([
+            [Q11, Q12, 0],
+            [Q12, Q11, 0],
+            [0,   0,   mat.G_xy]
+        ])
+
+        z_bot = k * layer_height - z_ref
+        z_top = (k + 1) * layer_height - z_ref
+
+        # ABD contributions
+        A += Q * (z_top - z_bot)
+        B += 0.5 * Q * (z_top**2 - z_bot**2)
+        D += (1.0 / 3.0) * Q * (z_top**3 - z_bot**3)
+
+        # Thermal loads: stress-free temp is each material's Tg
+        T_stress_free = mat.T_glass
+        delta_T = T_stress_free - T_room
+        if delta_T <= 0:
+            continue
+
+        # Thermal strain vector (isotropic CTE: equal in x and y, zero shear)
+        alpha_vec = np.array([mat.CTE, mat.CTE, 0.0])
+
+        # Thermal stress contribution from this layer: Q * alpha * dT
+        thermal_stress = Q @ alpha_vec * delta_T
+
+        # Integrate through layer thickness for N_T and M_T
+        N_T += thermal_stress * (z_top - z_bot)
+        M_T += 0.5 * thermal_stress * (z_top**2 - z_bot**2)
+
+    # Assemble and solve the 6x6 system
+    ABD = np.zeros((6, 6))
+    ABD[:3, :3] = A
+    ABD[:3, 3:] = B
+    ABD[3:, :3] = B
+    ABD[3:, 3:] = D
+
+    load = np.concatenate([N_T, M_T])
+
+    try:
+        response = np.linalg.solve(ABD, load)
+    except np.linalg.LinAlgError:
+        return 0.0, 0.0
+
+    # eps0 = response[:3]  # midplane strains
+    kappa = response[3:]  # curvatures [kappa_x, kappa_y, kappa_xy]
+
+    # Primary warping curvature (take the larger of kx, ky)
+    curvature = kappa[0]  # kappa_x
+
+    # Neutral axis (for reporting, not used in CLT warping calc)
     sum_EA_z = 0.0
     sum_EA = 0.0
     for k, mat in enumerate(layer_materials):
         z_mid = (k + 0.5) * layer_height
         sum_EA_z += mat.E * layer_height * z_mid
         sum_EA += mat.E * layer_height
-    z_neutral = sum_EA_z / sum_EA if sum_EA > 0 else h_total / 2.0
 
-    # Compute thermal curvature
-    # κ_thermal = Σ (E_k * α_k * ΔT_k * (z_k - z_neutral) * h_k) / EI_total
-    #
-    # This generalizes the Timoshenko formula to N layers.
-    # Positive curvature = concave up (bottom shrinks more).
-
-    # EI about neutral axis
-    EI = 0.0
-    sum_E_alpha_dT_z = 0.0
-
-    for k, mat in enumerate(layer_materials):
-        z_mid = (k + 0.5) * layer_height
-        d = z_mid - z_neutral
-
-        # EI contribution (parallel axis theorem)
-        I_layer = layer_height**3 / 12.0
-        EI += mat.E * (I_layer + layer_height * d**2)
-
-        # Thermal moment contribution
-        T_stress_free = mat.T_glass
-        delta_T = T_stress_free - T_room
-        if delta_T > 0:
-            sum_E_alpha_dT_z += mat.E * mat.CTE * delta_T * d * layer_height
-
-    curvature = sum_E_alpha_dT_z / EI if EI > 0 else 0.0
-
-    # Max deflection for a simply supported beam of length L
-    # δ = κ * L² / 8 (for uniform curvature)
-    L = 100.0  # mm, assume 100mm part length for reference
+    # Max deflection for uniform curvature: delta = kappa * L^2 / 8
+    L = 100.0  # mm reference part length
     warp_deflection = abs(curvature) * L**2 / 8.0
 
     return curvature, warp_deflection
