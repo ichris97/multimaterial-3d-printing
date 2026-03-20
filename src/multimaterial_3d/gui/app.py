@@ -903,7 +903,8 @@ class MainWindow(QMainWindow):
                             )
                             if gcode_mesh:
                                 self.viewer.show_gcode(
-                                    gcode_mesh, target='after'
+                                    gcode_mesh, target='after',
+                                    title='Modified G-code'
                                 )
                                 shown = True
                             break
@@ -916,8 +917,8 @@ class MainWindow(QMainWindow):
                     self.viewer.show_mesh(result_mesh, target='after',
                                           scalars='layer', cmap='turbo',
                                           title='Result')
-            except Exception:
-                pass
+            except Exception as e:
+                self._log(f"  Could not preview result: {e}")
 
     def _on_error(self, msg: str):
         self.progress.setVisible(False)
@@ -982,11 +983,11 @@ class MainWindow(QMainWindow):
                                             params['total_height'], material_map)
                 self._log(buf.getvalue())
 
-            self._finish_operation("Layer pattern applied successfully.")
             self._output_path = output
+            self._finish_operation("Layer pattern applied successfully.")
 
         except Exception as e:
-            self._on_error(str(e))
+            self._on_error(f"{e}\n{traceback.format_exc()}")
 
     def _run_interlock_perimeters(self, params):
         if not self._ensure_input(need_gcode=True):
@@ -1017,11 +1018,11 @@ class MainWindow(QMainWindow):
             new_gcode = ''.join(out_lines)
             repack_3mf(self._input_path, output, new_gcode, gcode_path)
 
-            self._finish_operation("Interlocking perimeters applied.")
             self._output_path = output
+            self._finish_operation("Interlocking perimeters applied.")
 
         except Exception as e:
-            self._on_error(str(e))
+            self._on_error(f"{e}\n{traceback.format_exc()}")
 
     def _run_topology_infill(self, params):
         if not self._ensure_input(need_gcode=True):
@@ -1055,11 +1056,11 @@ class MainWindow(QMainWindow):
             new_gcode = ''.join(modified)
             repack_3mf(self._input_path, output, new_gcode, gcode_path)
 
-            self._finish_operation("Topology-optimized infill applied.")
             self._output_path = output
+            self._finish_operation("Topology-optimized infill applied.")
 
         except Exception as e:
-            self._on_error(str(e))
+            self._on_error(f"{e}\n{traceback.format_exc()}")
 
     def _run_wall_infill(self, params):
         if not self._ensure_input(need_gcode=True):
@@ -1085,11 +1086,11 @@ class MainWindow(QMainWindow):
 
             repack_3mf(self._input_path, output, new_gcode, gcode_path)
 
-            self._finish_operation("Wall-infill interlocking applied.")
             self._output_path = output
+            self._finish_operation("Wall-infill interlocking applied.")
 
         except Exception as e:
-            self._on_error(str(e))
+            self._on_error(f"{e}\n{traceback.format_exc()}")
 
     def _run_analysis(self, params):
         self._start_progress("Running analysis...")
@@ -1119,7 +1120,7 @@ class MainWindow(QMainWindow):
             self.status.showMessage("Analysis complete.")
 
         except Exception as e:
-            self._on_error(str(e))
+            self._on_error(f"{e}\n{traceback.format_exc()}")
 
     def closeEvent(self, event):
         self.viewer.close()
