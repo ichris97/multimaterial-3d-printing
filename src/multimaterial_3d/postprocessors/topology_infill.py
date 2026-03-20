@@ -12,23 +12,31 @@ Stress Analysis Methods
 The stress map is computed using several geometric indicators:
 
 1. **Corner Detection**: Sharp corners in the model boundary act as stress
-   concentrators. The stress concentration factor (Kt) at a corner with
-   interior angle θ is approximately Kt ≈ 1 + 2*(180-θ)/180. Infill is
-   increased within a configurable radius around each corner.
+   concentrators. Both convex corners (exterior angles) and concave/re-entrant
+   corners (interior angles > 180 degrees) are detected. Re-entrant corners
+   are the most critical stress concentrators.
 
 2. **Thin Section Analysis**: Narrow regions of the model are weak points
    because they have less cross-sectional area to distribute load. The
    distance transform (EDT) is used to find how far each interior point
-   is from the nearest boundary — small distances indicate thin sections.
+   is from the nearest boundary -- small distances indicate thin sections.
 
 3. **Hole Proximity**: Areas around holes need reinforcement because holes
-   create stress concentrations of Kt ≈ 3 (for a circular hole in a
+   create stress concentrations of Kt ~ 3 (for a circular hole in a
    plate under uniaxial tension, from Kirsch solution).
 
 4. **Edge Proximity**: Points near the model boundary experience higher
    stresses under bending loads due to the linear stress distribution
-   (σ = M*y/I, maximum at the surface). Infill near walls is more
+   (sigma = M*y/I, maximum at the surface). Infill near walls is more
    structurally effective than infill at the center.
+
+Geometry Reconstruction
+-----------------------
+The actual model boundary is reconstructed from outer wall extrusion paths
+in the G-code. This preserves concave features, holes, notches, and
+L-shapes that would be lost by a convex hull approximation. Stress maps
+are computed per-layer (or per Z-range) so that geometry changes along
+the Z axis are properly accounted for.
 
 Infill Modification Strategy
 -----------------------------
@@ -52,7 +60,7 @@ import zipfile
 import hashlib
 import tempfile
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 import numpy as np
 
@@ -92,6 +100,18 @@ class StressRegion:
     y_max: float
     stress_level: float
     reason: str
+
+
+@dataclass
+class LayerContour:
+    """Contour data for a single layer.
+
+    Stores the outer wall paths that define the actual model boundary
+    at a specific Z height.
+    """
+    z_height: float
+    outer_walls: List[np.ndarray] = field(default_factory=list)
+    # Each outer_wall is an Mx2 array of XY points forming a closed path
 
 
 def parse_args():
@@ -204,6 +224,110 @@ def parse_3mf_model(data: bytes) -> np.ndarray:
     return vertices[np.array(triangles_idx)]
 
 
+def _order_contour_points(points: np.ndarray, tolerance: float = 0.5) -> np.ndarray:
+    """Order a set of extrusion points into a contour by connecting nearest neighbors.
+
+    G-code outer wall moves are generally sequential, so the input points
+    are usually already in order. This function validates that and handles
+    edge cases where points may need reordering.
+
+    Parameters
+    ----------
+    points : np.ndarray
+        Nx2 array of XY points from extrusion moves.
+    tolerance : float
+        Maximum gap (mm) between consecutive points to consider them connected.
+
+    Returns
+    -------
+    np.ndarray
+        Ordered Nx2 array forming a closed contour.
+    """
+    if len(points) < 3:
+        return points
+
+    # G-code wall moves are already sequential, so just return as-is
+    # if the path is reasonably continuous
+    diffs = np.diff(points, axis=0)
+    gaps = np.linalg.norm(diffs, axis=1)
+    max_gap = np.max(gaps) if len(gaps) > 0 else 0
+
+    if max_gap < tolerance * 10:
+        return points
+
+    # If there are large gaps, the points may include multiple segments.
+    # Use nearest-neighbor ordering as fallback.
+    ordered = [points[0]]
+    remaining = list(range(1, len(points)))
+
+    for _ in range(len(points) - 1):
+        if not remaining:
+            break
+        current = ordered[-1]
+        dists = [np.linalg.norm(points[r] - current) for r in remaining]
+        nearest_idx = np.argmin(dists)
+        ordered.append(points[remaining[nearest_idx]])
+        remaining.pop(nearest_idx)
+
+    return np.array(ordered)
+
+
+def _simplify_contour(points: np.ndarray, tolerance: float = 0.1) -> np.ndarray:
+    """Simplify a contour using the Ramer-Douglas-Peucker algorithm.
+
+    Reduces the number of points while preserving the shape within the
+    given tolerance. This is important for corner detection -- too many
+    points creates false corners, too few loses real ones.
+
+    Parameters
+    ----------
+    points : np.ndarray
+        Nx2 array of contour points.
+    tolerance : float
+        Maximum perpendicular distance (mm) for point removal.
+
+    Returns
+    -------
+    np.ndarray
+        Simplified contour points.
+    """
+    if len(points) < 3:
+        return points
+
+    def _rdp(pts, eps):
+        if len(pts) <= 2:
+            return pts
+
+        # Find point farthest from line between first and last
+        start, end = pts[0], pts[-1]
+        line_vec = end - start
+        line_len = np.linalg.norm(line_vec)
+
+        if line_len < 1e-10:
+            # Degenerate line, find farthest point from start
+            dists = np.linalg.norm(pts - start, axis=1)
+            max_idx = np.argmax(dists)
+            max_dist = dists[max_idx]
+        else:
+            line_unit = line_vec / line_len
+            # Perpendicular distances
+            vecs = pts - start
+            projs = np.outer(np.dot(vecs, line_unit), line_unit)
+            perps = vecs - projs
+            dists = np.linalg.norm(perps, axis=1)
+            max_idx = np.argmax(dists)
+            max_dist = dists[max_idx]
+
+        if max_dist > eps:
+            left = _rdp(pts[:max_idx + 1], eps)
+            right = _rdp(pts[max_idx:], eps)
+            return np.vstack([left[:-1], right])
+        else:
+            return np.array([pts[0], pts[-1]])
+
+    return _rdp(points, tolerance)
+
+
 def extract_geometry_from_gcode(gcode_content: str) -> Tuple[np.ndarray, list]:
     """Extract XY geometry from G-code extrusion moves.
 
@@ -247,54 +371,306 @@ def extract_geometry_from_gcode(gcode_content: str) -> Tuple[np.ndarray, list]:
     return arr, sorted(z_heights)
 
 
-def find_corners(boundary: np.ndarray, angle_threshold: float = 120) -> list:
+def extract_layer_contours(gcode_content: str) -> Dict[float, LayerContour]:
+    """Extract actual model contours from outer wall extrusion paths per layer.
+
+    The outer wall trace in G-code IS the actual model boundary at each layer.
+    This function extracts those paths to reconstruct the true geometry,
+    preserving concave features, holes, notches, and L-shapes.
+
+    Parameters
+    ----------
+    gcode_content : str
+        Full G-code content.
+
+    Returns
+    -------
+    dict mapping z_height -> LayerContour
+        Each LayerContour contains the ordered outer wall paths for that layer.
+    """
+    extrude_pattern = re.compile(
+        r'^G[01]\s+X([\d.]+)\s+Y([\d.]+).*E-?[\d.]+', re.IGNORECASE)
+    move_pattern = re.compile(
+        r'^G[01]\s+X([\d.]+)\s+Y([\d.]+)', re.IGNORECASE)
+    z_pattern = re.compile(r';\s*Z_HEIGHT:\s*([\d.]+)')
+    outer_wall_pattern = re.compile(
+        r';\s*FEATURE:\s*Outer\s*wall', re.IGNORECASE)
+    feature_pattern = re.compile(r';\s*FEATURE:', re.IGNORECASE)
+
+    layer_contours: Dict[float, LayerContour] = {}
+    current_z = 0.0
+    in_outer_wall = False
+    current_path: List[List[float]] = []
+
+    for line in gcode_content.split('\n'):
+        stripped = line.strip()
+
+        z_match = z_pattern.search(stripped)
+        if z_match:
+            current_z = float(z_match.group(1))
+
+        if outer_wall_pattern.search(stripped):
+            # Starting a new outer wall section
+            if current_path and len(current_path) >= 3:
+                _store_contour(layer_contours, current_z, current_path)
+            current_path = []
+            in_outer_wall = True
+            continue
+
+        if in_outer_wall and feature_pattern.search(stripped) and \
+                not outer_wall_pattern.search(stripped):
+            # Ended outer wall section
+            if current_path and len(current_path) >= 3:
+                _store_contour(layer_contours, current_z, current_path)
+            current_path = []
+            in_outer_wall = False
+            continue
+
+        if in_outer_wall:
+            match = extrude_pattern.match(stripped)
+            if match:
+                current_path.append(
+                    [float(match.group(1)), float(match.group(2))])
+
+    # Flush last path
+    if current_path and len(current_path) >= 3:
+        _store_contour(layer_contours, current_z, current_path)
+
+    return layer_contours
+
+
+def _store_contour(layer_contours: Dict[float, LayerContour],
+                   z: float, path: List[List[float]]) -> None:
+    """Store a completed outer wall path into the layer contours dict."""
+    if z not in layer_contours:
+        layer_contours[z] = LayerContour(z_height=z)
+    pts = np.array(path)
+    pts = _simplify_contour(pts, tolerance=0.15)
+    if len(pts) >= 3:
+        layer_contours[z].outer_walls.append(pts)
+
+
+def _point_in_polygon(px: float, py: float, polygon: np.ndarray) -> bool:
+    """Ray-casting point-in-polygon test (no external dependencies).
+
+    Parameters
+    ----------
+    px, py : float
+        Test point coordinates.
+    polygon : np.ndarray
+        Nx2 array of polygon vertices.
+
+    Returns
+    -------
+    bool
+        True if point is inside the polygon.
+    """
+    n = len(polygon)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if ((yi > py) != (yj > py)) and \
+                (px < (xj - xi) * (py - yi) / (yj - yi + 1e-30) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _polygon_area_signed(polygon: np.ndarray) -> float:
+    """Compute the signed area of a polygon (positive = CCW, negative = CW).
+
+    Uses the shoelace formula.
+    """
+    n = len(polygon)
+    if n < 3:
+        return 0.0
+    x = polygon[:, 0]
+    y = polygon[:, 1]
+    return 0.5 * np.sum(x[:-1] * y[1:] - x[1:] * y[:-1]) + \
+        0.5 * (x[-1] * y[0] - x[0] * y[-1])
+
+
+def _ensure_ccw(polygon: np.ndarray) -> np.ndarray:
+    """Ensure polygon vertices are in counter-clockwise order."""
+    if _polygon_area_signed(polygon) < 0:
+        return polygon[::-1]
+    return polygon
+
+
+def find_corners(boundary: np.ndarray, angle_threshold: float = 120,
+                 detect_concave: bool = True) -> list:
     """Find corner points in a 2D boundary polygon.
 
+    Detects both convex corners (sharp exterior angles) and concave/re-entrant
+    corners (angles > 180 degrees from the interior). Re-entrant corners are
+    the most critical stress concentrators in practice.
+
     A corner is defined as a vertex where the interior angle between
-    adjacent edges is less than the threshold. Sharper corners (smaller
-    angles) create higher stress concentrations.
+    adjacent edges deviates significantly from 180 degrees (a straight line).
 
     Parameters
     ----------
     boundary : np.ndarray
-        Nx2 array of boundary vertices in order.
+        Nx2 array of boundary vertices in order (CCW for outer boundary).
     angle_threshold : float
-        Maximum angle (degrees) to consider a vertex as a corner.
+        Maximum angle (degrees) to consider a vertex as a convex corner.
+    detect_concave : bool
+        If True, also detect concave (re-entrant) corners where the
+        interior angle exceeds (360 - angle_threshold) degrees.
 
     Returns
     -------
-    list of (x, y, angle) tuples
-        Detected corner locations and their interior angles.
+    list of (x, y, angle, is_concave) tuples
+        Detected corner locations, their interior angles, and whether
+        they are concave (re-entrant).
     """
     corners = []
     n = len(boundary)
+    if n < 3:
+        return corners
+
+    # Ensure CCW ordering for consistent interior angle computation
+    boundary = _ensure_ccw(boundary)
+
     for i in range(n):
         v1 = boundary[(i - 1) % n] - boundary[i]
         v2 = boundary[(i + 1) % n] - boundary[i]
-        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-10)
+
+        norm1 = np.linalg.norm(v1)
+        norm2 = np.linalg.norm(v2)
+        if norm1 < 1e-10 or norm2 < 1e-10:
+            continue
+
+        cos_angle = np.dot(v1, v2) / (norm1 * norm2)
         angle = np.degrees(np.arccos(np.clip(cos_angle, -1, 1)))
-        if angle < angle_threshold:
-            corners.append((boundary[i][0], boundary[i][1], angle))
+
+        # Use cross product to determine convexity
+        # For CCW polygon: positive cross = convex, negative = concave
+        cross = v1[0] * v2[1] - v1[1] * v2[0]
+
+        if cross >= 0:
+            # Convex corner -- interior angle is `angle`
+            is_concave = False
+            interior_angle = angle
+        else:
+            # Concave (re-entrant) corner -- interior angle is 360 - angle
+            is_concave = True
+            interior_angle = 360.0 - angle
+
+        if not is_concave and angle < angle_threshold:
+            corners.append((boundary[i][0], boundary[i][1], angle, False))
+        elif is_concave and detect_concave and (360.0 - angle) > (360.0 - angle_threshold):
+            # Re-entrant corner: the reflex angle makes it a stress concentrator.
+            # Severity is based on how far past 180 degrees the interior angle is.
+            corners.append((boundary[i][0], boundary[i][1], angle, True))
+
     return corners
+
+
+def _group_layers_into_z_ranges(
+        layer_contours: Dict[float, LayerContour],
+        max_ranges: int = 10
+) -> List[Tuple[float, float, List[LayerContour]]]:
+    """Group layers into Z-ranges for per-range stress map computation.
+
+    Layers with similar geometry are grouped together to avoid computing
+    a stress map for every single layer while still capturing geometry
+    changes along Z.
+
+    Parameters
+    ----------
+    layer_contours : dict
+        Mapping of z_height -> LayerContour.
+    max_ranges : int
+        Maximum number of Z-ranges.
+
+    Returns
+    -------
+    list of (z_min, z_max, contours) tuples
+    """
+    if not layer_contours:
+        return []
+
+    z_values = sorted(layer_contours.keys())
+    if len(z_values) <= max_ranges:
+        return [(z, z, [layer_contours[z]]) for z in z_values]
+
+    # Split into roughly equal ranges
+    chunk_size = max(1, len(z_values) // max_ranges)
+    ranges = []
+    for start in range(0, len(z_values), chunk_size):
+        chunk = z_values[start:start + chunk_size]
+        contours = [layer_contours[z] for z in chunk]
+        ranges.append((chunk[0], chunk[-1], contours))
+
+    return ranges
+
+
+def _build_mask_from_contours(
+        contours: List[np.ndarray],
+        x_min: float, y_min: float,
+        nx: int, ny: int,
+        res_x: float, res_y: float
+) -> np.ndarray:
+    """Build a boolean interior mask from actual contour polygons.
+
+    Uses ray-casting point-in-polygon for each grid cell. For multiple
+    contours (e.g., outer boundary + holes), the winding rule determines
+    interior: points inside an odd number of contours are interior.
+
+    Parameters
+    ----------
+    contours : list of np.ndarray
+        List of Nx2 polygon contours.
+    x_min, y_min : float
+        Grid origin.
+    nx, ny : int
+        Grid dimensions.
+    res_x, res_y : float
+        Grid resolution.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask (ny, nx) -- True for interior points.
+    """
+    mask = np.zeros((ny, nx), dtype=bool)
+
+    if not contours:
+        return mask
+
+    for i in range(ny):
+        y = y_min + i * res_y
+        for j in range(nx):
+            x = x_min + j * res_x
+            # Count how many contours contain this point (odd = inside)
+            count = sum(1 for c in contours if _point_in_polygon(x, y, c))
+            mask[i, j] = (count % 2 == 1)
+
+    return mask
 
 
 def calculate_stress_map(xy_points: np.ndarray, grid_resolution: float = 1.0,
                          corner_radius: float = 5.0, sensitivity: float = 0.5,
-                         verbose: bool = False) -> Tuple[np.ndarray, dict]:
+                         verbose: bool = False,
+                         layer_contours: Optional[Dict[float, LayerContour]] = None,
+                         z_height: Optional[float] = None
+                         ) -> Tuple[np.ndarray, dict]:
     """Compute a 2D stress concentration map from model geometry.
 
     The stress map is a 2D grid where each cell contains a value from 0 to 1
     indicating the relative stress level. High values mean more infill is needed.
 
-    The map combines contributions from multiple stress indicators:
-    - Corner proximity (weighted by corner sharpness)
-    - Edge proximity (thin sections need reinforcement)
-    - The contributions are combined using element-wise maximum
+    When layer_contours are provided, uses the actual outer wall paths to
+    reconstruct the true model boundary (preserving concave features, holes,
+    etc.) instead of a convex hull approximation.
 
     Parameters
     ----------
     xy_points : np.ndarray
-        Nx2 array of model boundary/geometry points.
+        Nx2 array of model boundary/geometry points (fallback).
     grid_resolution : float
         Grid cell size in mm.
     corner_radius : float
@@ -303,16 +679,27 @@ def calculate_stress_map(xy_points: np.ndarray, grid_resolution: float = 1.0,
         Detection sensitivity (0=aggressive, 1=conservative).
     verbose : bool
         Print analysis details.
+    layer_contours : dict, optional
+        Per-layer contour data from extract_layer_contours(). If provided,
+        actual geometry is used instead of convex hull.
+    z_height : float, optional
+        If provided with layer_contours, use the contour nearest this Z.
 
     Returns
     -------
     tuple of (stress_map, metadata)
     """
-    if len(xy_points) == 0:
+    # Determine which contours to use for this stress map
+    contours_for_analysis = _select_contours(
+        layer_contours, z_height, xy_points)
+
+    # Determine bounds from contours or fallback to xy_points
+    all_pts = _collect_all_points(contours_for_analysis, xy_points)
+    if len(all_pts) == 0:
         raise ValueError("No geometry points found")
 
-    x_min, y_min = xy_points.min(axis=0)
-    x_max, y_max = xy_points.max(axis=0)
+    x_min, y_min = all_pts.min(axis=0)
+    x_max, y_max = all_pts.max(axis=0)
 
     nx = min(int((x_max - x_min) / grid_resolution) + 1, 300)
     ny = min(int((y_max - y_min) / grid_resolution) + 1, 300)
@@ -321,54 +708,67 @@ def calculate_stress_map(xy_points: np.ndarray, grid_resolution: float = 1.0,
 
     stress_map = np.zeros((ny, nx))
 
-    # Compute convex hull for boundary approximation
-    boundary = None
-    if HAS_SCIPY and len(xy_points) > 3:
-        try:
-            unique = np.unique(xy_points, axis=0)
-            if len(unique) > 3:
-                hull = ConvexHull(unique)
-                boundary = unique[hull.vertices]
-        except Exception:
-            pass
+    # Get boundary polygons -- prefer actual contours over convex hull
+    boundaries = []
+    if contours_for_analysis:
+        boundaries = contours_for_analysis
+    else:
+        # Legacy fallback: convex hull (only if no contours available)
+        boundary = _compute_boundary_fallback(xy_points, x_min, y_min, x_max, y_max)
+        if boundary is not None:
+            boundaries = [boundary]
 
-    if boundary is None:
-        boundary = np.array([[x_min, y_min], [x_max, y_min],
-                             [x_max, y_max], [x_min, y_max]])
+    # Corner stress contribution (both convex and concave)
+    all_corners = []
+    for boundary in boundaries:
+        corners = find_corners(boundary, angle_threshold=150, detect_concave=True)
+        all_corners.extend(corners)
 
-    # Corner stress contribution
-    corners = find_corners(boundary, angle_threshold=150)
     model_size = max(x_max - x_min, y_max - y_min)
-    effective_radius = max(corner_radius, model_size * 0.3)
+    effective_radius = max(corner_radius, model_size * 0.15)
 
-    for cx, cy, angle in corners:
-        angle_factor = 1.0 - (angle / 180.0)
+    for cx, cy, angle, is_concave in all_corners:
+        if is_concave:
+            # Re-entrant corners are MORE severe stress concentrators
+            # Interior angle > 180 deg: stress factor increases with reflex
+            reflex_angle = 360.0 - angle
+            angle_factor = min(1.0, 0.5 + (reflex_angle - 180.0) / 180.0)
+            # Use a larger radius for concave corners
+            radius = effective_radius * 1.3
+        else:
+            angle_factor = 1.0 - (angle / 180.0)
+            radius = effective_radius
+
         for i in range(ny):
             for j in range(nx):
                 x = x_min + j * res_x
                 y = y_min + i * res_y
                 dist = np.sqrt((x - cx)**2 + (y - cy)**2)
-                if dist < effective_radius:
-                    stress = angle_factor * (1.0 - dist / effective_radius) ** 0.5
+                if dist < radius:
+                    stress = angle_factor * (1.0 - dist / radius) ** 0.5
                     stress_map[i, j] = max(stress_map[i, j], stress)
 
-    # Edge proximity stress (using distance transform)
-    if HAS_SHAPELY and HAS_SCIPY:
-        try:
-            poly = Polygon(boundary)
-            if not poly.is_valid:
-                poly = poly.buffer(0)
-            mask = np.zeros((ny, nx), dtype=bool)
-            for i in range(ny):
-                for j in range(nx):
-                    pt = Point(x_min + j * res_x, y_min + i * res_y)
-                    mask[i, j] = poly.contains(pt) or poly.boundary.distance(pt) < 0.5
+    # Edge proximity / thin section stress using actual contour mask
+    if HAS_SCIPY:
+        mask = _build_interior_mask(
+            boundaries, x_min, y_min, nx, ny, res_x, res_y)
+        if mask.any():
             dist_inside = distance_transform_edt(mask) * res_x
             thin_threshold = model_size * 0.25
             edge_stress = np.clip(1.0 - dist_inside / thin_threshold, 0, 1)
             stress_map = np.maximum(stress_map, edge_stress * 0.5)
-        except Exception:
-            pass
+    elif HAS_SHAPELY:
+        # Shapely fallback (kept for compatibility)
+        _apply_edge_stress_shapely(
+            boundaries, stress_map, x_min, y_min, nx, ny, res_x, res_y,
+            model_size)
+
+    # Hole detection: if there are multiple contours, inner ones may be holes
+    num_holes = 0
+    if len(boundaries) > 1:
+        num_holes = _detect_and_stress_holes(
+            boundaries, stress_map, x_min, y_min, nx, ny, res_x, res_y,
+            corner_radius)
 
     # Apply sensitivity and smooth
     stress_map = np.power(stress_map, 1.0 / (sensitivity + 0.5))
@@ -380,10 +780,235 @@ def calculate_stress_map(xy_points: np.ndarray, grid_resolution: float = 1.0,
         'bounds': (x_min, x_max, y_min, y_max),
         'grid_size': (nx, ny),
         'resolution': (res_x, res_y),
-        'corners': len(corners),
-        'holes': 0,
+        'corners': len(all_corners),
+        'concave_corners': sum(1 for c in all_corners if c[3]),
+        'holes': num_holes,
+        'used_actual_contours': len(contours_for_analysis) > 0,
     }
     return stress_map, metadata
+
+
+def _select_contours(
+        layer_contours: Optional[Dict[float, LayerContour]],
+        z_height: Optional[float],
+        xy_points: np.ndarray
+) -> List[np.ndarray]:
+    """Select the best contours for stress analysis.
+
+    If layer_contours and z_height are given, picks the nearest layer.
+    Otherwise returns empty list (caller falls back to convex hull).
+    """
+    if not layer_contours:
+        return []
+
+    if z_height is not None:
+        # Find nearest layer
+        z_vals = sorted(layer_contours.keys())
+        nearest_z = min(z_vals, key=lambda z: abs(z - z_height))
+        return layer_contours[nearest_z].outer_walls
+
+    # No specific Z requested -- merge contours from a representative layer
+    # Pick the layer with the most complex geometry (most contour points)
+    best_z = max(layer_contours.keys(),
+                 key=lambda z: sum(len(w) for w in layer_contours[z].outer_walls))
+    return layer_contours[best_z].outer_walls
+
+
+def _collect_all_points(contours: List[np.ndarray],
+                        fallback: np.ndarray) -> np.ndarray:
+    """Collect all XY points from contours or use fallback."""
+    if contours:
+        all_pts = np.vstack(contours) if contours else np.array([]).reshape(0, 2)
+        return all_pts
+    return fallback
+
+
+def _compute_boundary_fallback(xy_points: np.ndarray,
+                                x_min: float, y_min: float,
+                                x_max: float, y_max: float) -> Optional[np.ndarray]:
+    """Compute boundary using convex hull (legacy fallback)."""
+    if HAS_SCIPY and len(xy_points) > 3:
+        try:
+            unique = np.unique(xy_points, axis=0)
+            if len(unique) > 3:
+                hull = ConvexHull(unique)
+                return unique[hull.vertices]
+        except Exception:
+            pass
+
+    return np.array([[x_min, y_min], [x_max, y_min],
+                     [x_max, y_max], [x_min, y_max]])
+
+
+def _build_interior_mask(boundaries: List[np.ndarray],
+                          x_min: float, y_min: float,
+                          nx: int, ny: int,
+                          res_x: float, res_y: float) -> np.ndarray:
+    """Build interior mask from actual contour boundaries.
+
+    Uses shapely if available, otherwise falls back to ray-casting.
+    """
+    if HAS_SHAPELY:
+        try:
+            mask = np.zeros((ny, nx), dtype=bool)
+            polys = []
+            for b in boundaries:
+                if len(b) >= 3:
+                    p = Polygon(b)
+                    if not p.is_valid:
+                        p = p.buffer(0)
+                    polys.append(p)
+
+            if not polys:
+                return mask
+
+            # First polygon is outer, rest may be holes
+            # Use union for simplicity
+            from shapely.ops import unary_union
+            combined = unary_union(polys) if len(polys) > 1 else polys[0]
+
+            for i in range(ny):
+                for j in range(nx):
+                    pt = Point(x_min + j * res_x, y_min + i * res_y)
+                    mask[i, j] = combined.contains(pt) or \
+                        combined.boundary.distance(pt) < 0.5
+            return mask
+        except Exception:
+            pass
+
+    # Pure numpy fallback using ray-casting
+    return _build_mask_from_contours(
+        boundaries, x_min, y_min, nx, ny, res_x, res_y)
+
+
+def _apply_edge_stress_shapely(boundaries, stress_map, x_min, y_min,
+                                nx, ny, res_x, res_y, model_size):
+    """Apply edge/thin-section stress using shapely (no scipy needed)."""
+    try:
+        for b in boundaries:
+            if len(b) < 3:
+                continue
+            poly = Polygon(b)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            thin_threshold = model_size * 0.25
+            for i in range(ny):
+                for j in range(nx):
+                    pt = Point(x_min + j * res_x, y_min + i * res_y)
+                    if poly.contains(pt):
+                        dist = poly.boundary.distance(pt)
+                        edge_stress = max(0, 1.0 - dist / thin_threshold) * 0.5
+                        stress_map[i, j] = max(stress_map[i, j], edge_stress)
+    except Exception:
+        pass
+
+
+def _detect_and_stress_holes(boundaries, stress_map, x_min, y_min,
+                              nx, ny, res_x, res_y, hole_margin):
+    """Detect holes (inner contours inside outer contours) and add stress."""
+    if len(boundaries) < 2:
+        return 0
+
+    num_holes = 0
+    # Check if smaller contours are inside the largest one
+    areas = [abs(_polygon_area_signed(b)) for b in boundaries]
+    outer_idx = np.argmax(areas)
+    outer = boundaries[outer_idx]
+
+    for idx, inner in enumerate(boundaries):
+        if idx == outer_idx:
+            continue
+        # Check if centroid of inner is inside outer
+        centroid = inner.mean(axis=0)
+        if _point_in_polygon(centroid[0], centroid[1], outer):
+            num_holes += 1
+            # Add stress around hole boundary
+            for pt in inner:
+                for i in range(ny):
+                    for j in range(nx):
+                        x = x_min + j * res_x
+                        y = y_min + i * res_y
+                        dist = np.sqrt((x - pt[0])**2 + (y - pt[1])**2)
+                        if dist < hole_margin:
+                            # Kt ~ 3 for circular hole
+                            stress = 0.8 * (1.0 - dist / hole_margin)
+                            stress_map[i, j] = max(stress_map[i, j], stress)
+
+    return num_holes
+
+
+def calculate_stress_maps_per_layer(
+        gcode_content: str,
+        grid_resolution: float = 1.0,
+        corner_radius: float = 5.0,
+        sensitivity: float = 0.5,
+        verbose: bool = False,
+        max_z_ranges: int = 10
+) -> Dict[Tuple[float, float], Tuple[np.ndarray, dict]]:
+    """Compute per-Z-range stress maps from G-code contours.
+
+    Instead of a single global 2D stress map applied to all layers, this
+    computes stress maps for groups of layers that share similar geometry.
+
+    Parameters
+    ----------
+    gcode_content : str
+        Full G-code content.
+    grid_resolution : float
+        Grid cell size in mm.
+    corner_radius : float
+        Radius of influence around corners in mm.
+    sensitivity : float
+        Detection sensitivity.
+    verbose : bool
+        Print analysis details.
+    max_z_ranges : int
+        Maximum number of Z-ranges to compute.
+
+    Returns
+    -------
+    dict mapping (z_min, z_max) -> (stress_map, metadata)
+    """
+    layer_contours = extract_layer_contours(gcode_content)
+
+    if not layer_contours:
+        # Fallback to global stress map
+        xy_points, _ = extract_geometry_from_gcode(gcode_content)
+        stress_map, metadata = calculate_stress_map(
+            xy_points, grid_resolution, corner_radius, sensitivity, verbose)
+        z_min = min(layer_contours.keys()) if layer_contours else 0.0
+        z_max = max(layer_contours.keys()) if layer_contours else 999.0
+        return {(z_min, z_max): (stress_map, metadata)}
+
+    z_ranges = _group_layers_into_z_ranges(layer_contours, max_z_ranges)
+    result = {}
+
+    for z_min, z_max, contours in z_ranges:
+        # Merge contours from all layers in this range
+        # Use the layer with the most complex geometry as representative
+        best_contour = max(contours,
+                           key=lambda c: sum(len(w) for w in c.outer_walls))
+        all_walls = best_contour.outer_walls
+
+        if not all_walls:
+            continue
+
+        all_pts = np.vstack(all_walls) if all_walls else np.array([]).reshape(0, 2)
+
+        # Create a temporary layer_contours dict for calculate_stress_map
+        temp_contours = {best_contour.z_height: best_contour}
+
+        try:
+            stress_map, metadata = calculate_stress_map(
+                all_pts, grid_resolution, corner_radius, sensitivity,
+                verbose, layer_contours=temp_contours,
+                z_height=best_contour.z_height)
+            metadata['z_range'] = (z_min, z_max)
+            result[(z_min, z_max)] = (stress_map, metadata)
+        except ValueError:
+            continue
+
+    return result
 
 
 def get_stress_at_point(stress_map: np.ndarray, metadata: dict,
@@ -398,17 +1023,40 @@ def get_stress_at_point(stress_map: np.ndarray, metadata: dict,
     return stress_map[i, j]
 
 
+def get_stress_at_point_z(stress_maps: Dict[Tuple[float, float], Tuple[np.ndarray, dict]],
+                           x: float, y: float, z: float) -> float:
+    """Look up stress at a specific XYZ coordinate using per-layer stress maps.
+
+    Finds the Z-range containing the given Z height and returns the stress
+    at (x, y) from that range's stress map.
+    """
+    for (z_min, z_max), (stress_map, metadata) in stress_maps.items():
+        if z_min <= z <= z_max or (z_min == z_max and abs(z - z_min) < 0.5):
+            return get_stress_at_point(stress_map, metadata, x, y)
+
+    # Z not in any range -- try the nearest
+    if stress_maps:
+        nearest_key = min(stress_maps.keys(),
+                          key=lambda k: min(abs(z - k[0]), abs(z - k[1])))
+        sm, md = stress_maps[nearest_key]
+        return get_stress_at_point(sm, md, x, y)
+
+    return 0.0
+
+
 def modify_infill_density(gcode_lines: List[str], stress_map: np.ndarray,
                           metadata: dict, min_density: int, max_density: int,
-                          verbose: bool = False) -> List[str]:
+                          verbose: bool = False,
+                          stress_maps: Optional[Dict] = None
+                          ) -> List[str]:
     """Modify G-code infill sections based on the stress map.
 
     Processes each sparse infill region and adds reinforcement passes
     (extra parallel extrusion lines) in areas where the stress map indicates
     high stress concentration.
 
-    The reinforcement lines are offset perpendicular to the original infill
-    line direction, effectively increasing the local infill density.
+    When stress_maps (per-layer) is provided, uses the Z-appropriate stress
+    map for each layer instead of a single global map.
     """
     output = []
     sparse_infill = re.compile(r';\s*FEATURE:\s*Sparse infill', re.IGNORECASE)
@@ -419,10 +1067,13 @@ def modify_infill_density(gcode_lines: List[str], stress_map: np.ndarray,
 
     in_infill = False
     infill_lines = []
+    current_z = 0.0
     stats = {'layers_modified': 0, 'extra_lines': 0}
 
     for line in gcode_lines:
         z_match = z_pattern.search(line)
+        if z_match:
+            current_z = float(z_match.group(1))
 
         if sparse_infill.search(line):
             in_infill = True
@@ -432,7 +1083,14 @@ def modify_infill_density(gcode_lines: List[str], stress_map: np.ndarray,
 
         if in_infill and other_feature.search(line):
             in_infill = False
-            modified = _process_infill_region(infill_lines, stress_map, metadata)
+            # Choose the right stress map for this Z
+            if stress_maps:
+                layer_sm, layer_md = _get_layer_stress_map(
+                    stress_maps, current_z, stress_map, metadata)
+            else:
+                layer_sm, layer_md = stress_map, metadata
+
+            modified = _process_infill_region(infill_lines, layer_sm, layer_md)
             if len(modified) > len(infill_lines):
                 stats['layers_modified'] += 1
                 stats['extra_lines'] += len(modified) - len(infill_lines)
@@ -450,6 +1108,19 @@ def modify_infill_density(gcode_lines: List[str], stress_map: np.ndarray,
         print(f"   Extra infill lines added: {stats['extra_lines']}")
 
     return output
+
+
+def _get_layer_stress_map(stress_maps, z, default_map, default_metadata):
+    """Get the stress map for a given Z from per-layer maps."""
+    for (z_min, z_max), (sm, md) in stress_maps.items():
+        if z_min <= z <= z_max or (z_min == z_max and abs(z - z_min) < 0.5):
+            return sm, md
+    # Find nearest
+    if stress_maps:
+        nearest = min(stress_maps.keys(),
+                      key=lambda k: min(abs(z - k[0]), abs(z - k[1])))
+        return stress_maps[nearest]
+    return default_map, default_metadata
 
 
 def _process_infill_region(infill_lines: List[str], stress_map: np.ndarray,
@@ -512,7 +1183,13 @@ def visualize_stress_map(stress_map: np.ndarray, metadata: dict,
                        cmap='hot', vmin=0, vmax=1)
         ax.set_xlabel('X (mm)')
         ax.set_ylabel('Y (mm)')
-        ax.set_title('Stress Concentration Map\n(Bright = High Stress = More Infill)')
+        title = 'Stress Concentration Map\n(Bright = High Stress = More Infill)'
+        if metadata.get('z_range'):
+            z_min, z_max = metadata['z_range']
+            title += f'\nZ range: {z_min:.1f} - {z_max:.1f} mm'
+        if metadata.get('concave_corners', 0) > 0:
+            title += f'\n({metadata["concave_corners"]} re-entrant corners detected)'
+        ax.set_title(title)
         plt.colorbar(im, ax=ax, label='Stress Level')
         plt.tight_layout()
         plt.savefig(output_path, dpi=150)
@@ -553,16 +1230,46 @@ def main():
 
     gcode_content, gcode_path = extract_gcode_from_3mf(args.input_3mf)
 
-    # Get geometry from G-code if no 3D model available
-    xy_points, z_heights = extract_geometry_from_gcode(gcode_content)
-    print(f"   Extracted {len(xy_points)} geometry points from {len(z_heights)} layers")
+    # Extract actual contours from outer wall paths (per layer)
+    layer_contours = extract_layer_contours(gcode_content)
+    num_contour_layers = len(layer_contours)
+    total_contours = sum(len(lc.outer_walls) for lc in layer_contours.values())
 
-    # Calculate stress map
+    # Also get legacy point cloud for fallback
+    xy_points, z_heights = extract_geometry_from_gcode(gcode_content)
+
+    if num_contour_layers > 0:
+        print(f"   Extracted {total_contours} outer wall contours from "
+              f"{num_contour_layers} layers")
+    else:
+        print(f"   No outer wall contours found, using {len(xy_points)} "
+              f"geometry points from {len(z_heights)} layers")
+
+    # Calculate per-layer stress maps
     print(f"\nAnalyzing stress concentrations...")
-    stress_map, metadata = calculate_stress_map(
-        xy_points, corner_radius=args.corner_radius,
-        sensitivity=args.sensitivity, verbose=args.verbose
-    )
+
+    if num_contour_layers > 0:
+        stress_maps = calculate_stress_maps_per_layer(
+            gcode_content,
+            corner_radius=args.corner_radius,
+            sensitivity=args.sensitivity,
+            verbose=args.verbose
+        )
+        # Use the most representative map for summary stats
+        if stress_maps:
+            representative = max(stress_maps.values(),
+                                 key=lambda v: v[0].max())
+            stress_map, metadata = representative
+        else:
+            stress_map, metadata = calculate_stress_map(
+                xy_points, corner_radius=args.corner_radius,
+                sensitivity=args.sensitivity, verbose=args.verbose)
+            stress_maps = None
+    else:
+        stress_map, metadata = calculate_stress_map(
+            xy_points, corner_radius=args.corner_radius,
+            sensitivity=args.sensitivity, verbose=args.verbose)
+        stress_maps = None
 
     stress_mean = stress_map.mean()
     stress_max = stress_map.max()
@@ -571,7 +1278,13 @@ def main():
     print(f"   Average stress: {stress_mean:.2%}")
     print(f"   Maximum stress: {stress_max:.2%}")
     print(f"   High-stress area: {high_stress_pct:.1f}%")
-    print(f"   Corners detected: {metadata['corners']}")
+    print(f"   Corners detected: {metadata['corners']} "
+          f"({metadata.get('concave_corners', 0)} concave/re-entrant)")
+    print(f"   Holes detected: {metadata.get('holes', 0)}")
+    if metadata.get('used_actual_contours'):
+        print(f"   Using actual model contours (not convex hull)")
+    if stress_maps:
+        print(f"   Computed {len(stress_maps)} per-Z-range stress maps")
 
     if args.visualize:
         viz_path = args.output_3mf.replace('.3mf', '_stress_map.png')
@@ -583,7 +1296,8 @@ def main():
     gcode_lines = gcode_content.splitlines(keepends=True)
     modified = modify_infill_density(gcode_lines, stress_map, metadata,
                                      args.min_density, args.max_density,
-                                     verbose=args.verbose)
+                                     verbose=args.verbose,
+                                     stress_maps=stress_maps)
 
     new_gcode = ''.join(modified)
     print(f"\nCreating {args.output_3mf}...")

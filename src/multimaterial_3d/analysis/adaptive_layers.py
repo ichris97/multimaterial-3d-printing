@@ -106,16 +106,31 @@ def compute_adaptive_layer_heights(
     complexity = np.zeros(len(z_samples))
 
     for i, z in enumerate(z_samples):
-        # Find triangles that span this Z height
+        # Find triangles whose Z extent spans this height. Note: large
+        # triangles that span many Z levels will be included at every
+        # sample within their range, which adds noise but is acceptable
+        # because such triangles still contribute to the local surface
+        # orientation at each Z slice they intersect.
         mask = (tri_z_min <= z) & (tri_z_max >= z)
         if mask.sum() == 0:
             continue
 
         local_nz = abs_nz[mask]
 
-        # The "slope factor" peaks for surfaces at ~45 degrees, where
-        # staircase artifacts are most visible and problematic.
-        # slope_factor = |nz| * sqrt(1 - nz²) peaks at nz = 1/√2 (45°)
+        # Design choice: "slope factor" = |nz| * sqrt(1 - nz^2)
+        #
+        # This peaks at 45 degrees (nz = 1/sqrt(2)), NOT at horizontal
+        # surfaces (nz = 1). The pure staircase error is proportional to
+        # |nz| alone, which is maximal for horizontal surfaces. However,
+        # horizontal surfaces (|nz| ~ 1) are typically top/bottom faces
+        # where the staircase pattern is not visible to the eye — it is
+        # the flat face itself. The *visible* staircase artifacts appear
+        # on sloped surfaces, especially around 30-60 degrees, where the
+        # stepping between layers creates a sawtooth profile viewed from
+        # the side. This metric therefore optimises for VISUAL quality
+        # rather than geometric accuracy.
+        #
+        # Alternative: use |nz| directly for geometric-error minimisation.
         slope_factor = local_nz * np.sqrt(1 - local_nz**2 + 1e-10)
         complexity[i] = slope_factor.mean()
 
@@ -123,8 +138,16 @@ def compute_adaptive_layer_heights(
     if complexity.max() > 0:
         complexity /= complexity.max()
 
-    # Add curvature signal: rate of change of cross-section complexity
-    # High curvature = surface angle changes rapidly = needs thin layers
+    # Curvature signal: second derivative of triangle count vs Z.
+    #
+    # This is a rough proxy for vertical curvature. It works well for
+    # shapes where curvature correlates with changing cross-section
+    # (e.g., domes, tapers, fillets) but poorly for shapes with
+    # constant cross-section and high curvature (e.g., a sphere
+    # tessellated uniformly has roughly constant triangle count per
+    # slice, and a cylinder has varying count but zero vertical
+    # curvature). Despite these limitations, it is inexpensive and
+    # catches the most common cases where layer refinement helps.
     tri_counts = np.array([
         ((tri_z_min <= z) & (tri_z_max >= z)).sum()
         for z in z_samples
@@ -153,8 +176,17 @@ def compute_adaptive_layer_heights(
         lh = round(lh / 0.01) * 0.01
         lh = max(lh, min_height)
 
-        layers.append((round(z, 4), lh))
-        z += lh
+        # Clamp the last layer so it does not overshoot z_max
+        remaining = z_max - z
+        if lh > remaining:
+            lh = max(round(remaining / 0.01) * 0.01, min_height)
+            # If even min_height overshoots, accept min_height as final
+            if lh < min_height:
+                lh = min_height
+
+        layers.append((round(z, 4), round(lh, 4)))
+        # Round z after each step to prevent accumulated floating-point drift
+        z = round(z + lh, 4)
 
     return layers
 
